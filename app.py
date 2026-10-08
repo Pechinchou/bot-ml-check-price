@@ -127,9 +127,12 @@ async def lifespan(_):
 app = FastAPI(lifespan=lifespan, dependencies=[Depends(require_token)])
 
 
-async def has_captcha(page) -> bool:
-    return "captcha" in page.url or any(p in page.url for p in BLOCK_PATHS) \
-        or await page.query_selector(SEL_CAPTCHA) is not None
+async def has_captcha(page) -> str:
+    """O que indicou bloqueio/captcha (vazio = nada); o motivo vai no `detail` da resposta."""
+    if "captcha" in page.url or any(p in page.url for p in BLOCK_PATHS):
+        return f"url: {page.url}"
+    el = await page.query_selector(SEL_CAPTCHA)
+    return f"elemento: {(await el.evaluate('e => e.outerHTML'))[:160]}" if el else ""
 
 
 async def wait_captcha(page) -> bool:
@@ -271,8 +274,9 @@ async def fetch_store(url: str) -> dict:
                 return {"status": "invalid_link"}
             if "login" in page.url or "registration" in page.url:
                 return {"status": "login_required"}
-            if await has_captcha(page) and (HEADLESS or not await wait_captcha(page)):
-                return {"status": "captcha"}  # headless: ninguém para resolver, não espera
+            if reason := await has_captcha(page):
+                if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
+                    return {"status": "captcha", "detail": reason}
             price, html = await read_price(page), await page.content()
             if price is None:
                 return {"status": "not_found"}
