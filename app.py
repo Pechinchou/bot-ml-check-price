@@ -140,9 +140,24 @@ async def lifespan(_):
     if not API_TOKEN:
         logging.getLogger("uvicorn.error").warning("API_TOKEN não definido: API sem autenticação")
     # headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela
-    async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR") as ctx:
+    async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR",
+                             # fechar a última aba (ex. pela tela do noVNC) não pode encerrar o navegador do servidor
+                             firefox_user_prefs={"browser.tabs.closeWindowWithLastTab": False}) as ctx:
         browser_ctx = ctx
-        yield
+        closing = {"on": False}
+
+        def on_browser_close(*_):
+            # navegador fechou/morreu (janela fechada no noVNC, falta de memória, crash): sem ele toda chamada dá 500.
+            # Encerra o processo para o Docker (restart: unless-stopped) subir tudo de novo.
+            if not closing["on"]:
+                logging.getLogger("uvicorn.error").error("navegador fechou: encerrando o processo para reiniciar")
+                os._exit(1)
+
+        ctx.on("close", on_browser_close)
+        try:
+            yield
+        finally:
+            closing["on"] = True  # desligamento normal não é falha
 
 
 app = FastAPI(lifespan=lifespan)  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
