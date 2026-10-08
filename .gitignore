@@ -1,3 +1,4 @@
 profile/
 .venv/
 __pycache__/
+.env
