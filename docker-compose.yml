@@ -24,6 +24,8 @@ services:
     profiles: ["login"]
     build: .
     command: ["./login.sh"]
+    environment:
+      VERIFY_URL: ${VERIFY_URL:-}  # opcional: link de produto para resolver o captcha depois do login
     ports: ["127.0.0.1:6080:6080"]  # só localhost do servidor: nunca expor o noVNC (sem senha) na internet
     volumes:
       - ./profile:/app/profile  # mesmo perfil do verify; não rodar os dois ao mesmo tempo (lock do Firefox)
