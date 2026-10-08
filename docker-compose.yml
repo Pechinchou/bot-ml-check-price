@@ -1,0 +1,18 @@
+services:
+  verify:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      HEADLESS: virtual
+      API_TOKEN: ${API_TOKEN:?defina API_TOKEN no .env}  # recusa subir com a API aberta
+    volumes:
+      - ./profile:/app/profile  # sessão logada do Mercado Livre (logar no Mac e copiar a pasta)
+    shm_size: "2gb"  # Firefox trava com o /dev/shm padrão de 64 MB
+    init: true       # reaper de processos: evita Camoufox órfão segurando o perfil
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/docs')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s

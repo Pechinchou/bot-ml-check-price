@@ -22,7 +22,8 @@ SEL_LOGGED_IN = "a.nav-header-user-myml, .nav-header-user-myml, [data-js='user-m
 COUPONS_URL = "https://www.mercadolivre.com.br/cupons/active"
 COUPONS_TTL_S = 300
 STORE_TTL_S = 600  # cache da leitura da loja por URL
-HEADLESS = os.getenv("HEADLESS", "0").lower() in ("1", "true", "yes")  # headless: sem janela, não dá p/ resolver captcha
+_h = os.getenv("HEADLESS", "0").lower()
+HEADLESS = "virtual" if _h == "virtual" else _h in ("1", "true", "yes")  # virtual = Xvfb (só Linux/Docker); headless: não dá p/ resolver captcha
 ADD_COUPON_URL = "https://www.mercadolivre.com.br/cupons"
 SEL_ADD_COUPON_LINK = "text=Inserir código >> visible=true"
 SEL_ADD_COUPON_INPUT = "input[placeholder*='código do cupom' i]"
