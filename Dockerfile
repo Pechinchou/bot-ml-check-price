@@ -17,8 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ gcc libc6-d
 # modo login: VNC + noVNC para logar/resolver captcha pelo navegador (camada após o fetch para não refazer o download)
 RUN apt-get update && apt-get install -y --no-install-recommends x11vnc novnc websockify \
     && rm -rf /var/lib/apt/lists/*
-COPY app.py login.py login.sh ./
+# websockets (ponte noVNC da API) fora do requirements.txt: mexer nele invalidaria a camada do navegador (1,3 GB)
+RUN pip install websockets
+COPY app.py login.py login.sh start.sh ./
 
 # um único worker: o perfil do Firefox (profile/) só aceita um processo
 # ponytail: roda como root; não-root exigiria acertar permissões do volume profile/ vindo do host
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./start.sh"]

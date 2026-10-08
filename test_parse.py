@@ -1,4 +1,7 @@
-from app import coupon_failure, compare, discount, final_verdict, fresh, host_allowed, parse_price
+import tempfile
+from pathlib import Path
+
+from app import coupon_failure, compare, discount, final_verdict, fresh, host_allowed, parse_price, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -25,4 +28,11 @@ assert coupon_failure("Inserir Erro Confira se o cupom está correto") == "coupo
 assert coupon_failure("Este cupom já foi adicionado") == "coupon_unverified"
 assert coupon_failure("O cupom esgotou. Há outros") == "coupon_sold_out"
 assert coupon_failure("O cupom não está mais disponível.") == "coupon_expired"
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d) / "novnc"; root.mkdir(); (root / "vnc.html").write_text("x"); (Path(d) / "segredo").write_text("s")
+    assert safe_static_path(root, "vnc.html") and not safe_static_path(root, "../segredo")
+    assert not safe_static_path(root, "nao-existe") and not safe_static_path(root, "/etc/passwd")
+S = {"token": "abc", "status": "pending", "expires_at": 100}
+assert session_valid(S, "abc", 99) and not session_valid(S, "abc", 101) and not session_valid(S, "xyz", 99)
+assert not session_valid({**S, "status": "solved"}, "abc", 99) and not session_valid(None, "abc", 99)
 print("ok")

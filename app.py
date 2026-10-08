@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from camoufox.async_api import AsyncCamoufox
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
+from pathlib import Path
 from urllib.parse import urlparse
 
 # Seletores do ML isolados aqui: se o layout mudar, é só ajustar estas constantes.
@@ -24,6 +26,12 @@ COUPONS_TTL_S = 300
 STORE_TTL_S = 600  # cache da leitura da loja por URL
 _h = os.getenv("HEADLESS", "0").lower()
 HEADLESS = "virtual" if _h == "virtual" else _h in ("1", "true", "yes")  # virtual = Xvfb (só Linux/Docker); headless: não dá p/ resolver captcha
+# display = navegador visível numa tela virtual fixa (DISPLAY, ex. :99) espelhada por VNC: captcha resolvido remotamente (/captcha/*)
+SOLVE_REMOTE = _h == "display"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+CAPTCHA_SESSION_TTL_S = float(os.getenv("CAPTCHA_SESSION_TTL_S", "900"))
+NOVNC_ROOT = Path(os.getenv("NOVNC_ROOT", "/usr/share/novnc"))
+VNC_ADDR = ("127.0.0.1", 5900)  # x11vnc só em localhost; quem expõe é a ponte /vnc/{token}/websockify
 ADD_COUPON_URL = "https://www.mercadolivre.com.br/cupons"
 SEL_ADD_COUPON_LINK = "text=Inserir código >> visible=true"
 SEL_ADD_COUPON_INPUT = "input[placeholder*='código do cupom' i]"
@@ -44,6 +52,7 @@ eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; só guarda "el
 captcha_free = asyncio.Event()
 captcha_free.set()
 coupons_cache = (0.0, {})  # (timestamp, {code: cupom})
+captcha_state = {"needed": False, "blocked_url": None, "since": None, "session": None}  # 1 sessão de resolução por vez
 store_cache: dict[str, tuple[float, dict]] = {}  # ponytail: sem limpeza ativa, só sobrescreve; adicionar varredura se houver muitas URLs distintas
 store_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # 1 consulta por URL, mesmo em lote
 
@@ -92,6 +101,18 @@ def coupon_failure(msg: str) -> str:
     return "coupon_unverified"
 
 
+def safe_static_path(root: Path, rel: str) -> Path | None:
+    """Arquivo dentro de root (bloqueia ../ e links para fora); None se não existe."""
+    p = (root / rel).resolve()
+    return p if p.is_relative_to(root.resolve()) and p.is_file() else None
+
+
+def session_valid(session: dict | None, token: str, now: float) -> bool:
+    """O token da URL do noVNC só vale para a sessão pendente e não expirada."""
+    return bool(session and session["status"] == "pending" and now < session["expires_at"]
+                and secrets.compare_digest(session["token"], token))
+
+
 class Item(BaseModel):
     url: str
     price: float
@@ -124,7 +145,8 @@ async def lifespan(_):
         yield
 
 
-app = FastAPI(lifespan=lifespan, dependencies=[Depends(require_token)])
+app = FastAPI(lifespan=lifespan)  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
+api = APIRouter(dependencies=[Depends(require_token)])
 
 
 async def has_captcha(page) -> str:
@@ -264,6 +286,8 @@ async def pace():
 
 async def fetch_store(url: str) -> dict:
     """Abre o produto e lê preço + item_id da página; ou {"status": erro}."""
+    if (cs := captcha_state["session"]) and cs["status"] == "pending":  # alguém está resolvendo: não enfileira
+        return {"status": "captcha", "detail": "verificação em andamento"}
     await captcha_free.wait()
     async with slots:
         await pace()
@@ -275,11 +299,15 @@ async def fetch_store(url: str) -> dict:
             if "login" in page.url or "registration" in page.url:
                 return {"status": "login_required"}
             if reason := await has_captcha(page):
+                if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
+                    captcha_state.update(needed=True, blocked_url=url, since=captcha_state["since"] or time.time())
+                    return {"status": "captcha", "detail": reason}
                 if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
                     return {"status": "captcha", "detail": reason}
             price, html = await read_price(page), await page.content()
             if price is None:
                 return {"status": "not_found"}
+            captcha_state.update(needed=False, since=None)  # leitura normal: o bloqueio passou
             ids = Counter(re.findall(r'"item_id":"(MLB\d+)"', html))  # a oferta vencedora é a mais citada
             loyalty = re.search(r'"loyalty_level":(\d+)', html)  # a rota de cupons do produto exige o nível
             return {"status": "ok", "price": price, "item_id": ids.most_common(1)[0][0] if ids else None,
@@ -338,7 +366,7 @@ async def run(item: Item) -> dict:
         return {"status": "timeout"}
 
 
-@app.get("/session")
+@api.get("/session")
 async def session():
     page = await browser_ctx.new_page()
     try:
@@ -348,11 +376,126 @@ async def session():
         await page.close()
 
 
-@app.post("/check")
+@api.post("/check")
 async def check_one(item: Item):
     return await run(item)
 
 
-@app.post("/check/batch")
+@api.post("/check/batch")
 async def check_batch(items: list[Item]):
     return await asyncio.gather(*(run(i) for i in items))
+
+
+# --- Resolver captcha pelo dashboard: sessão com link do noVNC (ponte VNC servida pela própria API) ---
+
+class CaptchaReq(BaseModel):
+    url: str | None = None
+
+
+def vnc_url(token: str) -> str:
+    # noVNC 1.6 resolve `path` relativo à URL da página (/vnc/{token}/), então basta "websockify"
+    return f"{PUBLIC_BASE_URL}/vnc/{token}/vnc.html?autoconnect=1&resize=scale&path=websockify"
+
+
+async def watch_session(s: dict):
+    """Resolvida quando a página sai da parede de captcha e mostra produto/menu logado; expira após o TTL."""
+    page = s["page"]
+    try:
+        while time.time() < s["expires_at"]:
+            await asyncio.sleep(3)
+            if not await has_captcha(page) and await page.query_selector(f"{SEL_PRICE_META}, {SEL_LOGGED_IN}"):
+                await asyncio.sleep(5)  # deixa os cookies serem gravados no perfil
+                s["status"] = "solved"
+                captcha_state.update(needed=False, since=None)
+                return
+        s["status"] = "expired"
+    except Exception as e:
+        s.update(status="expired", detail=str(e))
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+@api.get("/captcha/status")
+async def captcha_status():
+    s = captcha_state["session"]
+    return {"needed": captcha_state["needed"], "blocked_url": captcha_state["blocked_url"],
+            "since": captcha_state["since"], "session": {"id": s["id"], "status": s["status"]} if s else None}
+
+
+@api.post("/captcha/session")
+async def captcha_session(req: CaptchaReq | None = None):
+    s = captcha_state["session"]
+    if not (s and s["status"] == "pending"):
+        url = (req.url if req and req.url else captcha_state["blocked_url"]) or "https://www.mercadolivre.com.br/"
+        if not host_allowed(url):
+            raise HTTPException(422, "url deve ser do Mercado Livre")
+        page = await browser_ctx.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            await page.bring_to_front()
+        except Exception as e:
+            await page.close()
+            raise HTTPException(502, f"não abriu a página: {e}")
+        s = {"id": secrets.token_hex(8), "token": secrets.token_urlsafe(32), "status": "pending", "detail": "",
+             "expires_at": time.time() + CAPTCHA_SESSION_TTL_S, "page": page}
+        captcha_state["session"] = s
+        s["task"] = asyncio.create_task(watch_session(s))  # referência forte: senão o GC pode matar a tarefa
+    return {"id": s["id"], "url": vnc_url(s["token"]), "expires_in": int(s["expires_at"] - time.time())}
+
+
+@api.get("/captcha/session/{sid}")
+async def captcha_session_status(sid: str):
+    s = captcha_state["session"]
+    if not s or s["id"] != sid:
+        raise HTTPException(404, "sessão não encontrada")
+    return {"status": s["status"], "detail": s["detail"]}
+
+
+def active_session(token: str) -> dict | None:
+    s = captcha_state["session"]
+    return s if session_valid(s, token, time.time()) else None
+
+
+@app.get("/vnc/{token}/{path:path}")
+async def vnc_static(token: str, path: str):
+    """Cliente noVNC (arquivos de /usr/share/novnc); a autorização é o token da sessão na URL."""
+    if not active_session(token):
+        raise HTTPException(404)
+    f = safe_static_path(NOVNC_ROOT, path or "vnc.html")
+    if not f:
+        raise HTTPException(404)
+    return FileResponse(f)
+
+
+@app.websocket("/vnc/{token}/websockify")
+async def vnc_bridge(ws: WebSocket, token: str):
+    """Ponte WebSocket <-> x11vnc (equivalente ao websockify): repassa bytes RFB nos dois sentidos."""
+    if not active_session(token):
+        await ws.close(code=1008)
+        return
+    # só ecoa o subprotocolo se o cliente pediu: o Chrome recusa o handshake se a resposta trouxer um que ele não ofereceu
+    await ws.accept(subprotocol="binary" if "binary" in ws.scope.get("subprotocols", []) else None)
+    reader, writer = await asyncio.open_connection(*VNC_ADDR)
+
+    async def up():
+        while True:
+            writer.write(await ws.receive_bytes())
+            await writer.drain()
+
+    async def down():
+        while data := await reader.read(65536):
+            await ws.send_bytes(data)
+
+    tasks = [asyncio.create_task(up()), asyncio.create_task(down())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)  # ponytail: a conexão aberta sobrevive ao fim da sessão até o cliente fechar
+    finally:
+        for t in tasks:
+            t.cancel()
+        writer.close()
+
+
+app.include_router(api)
