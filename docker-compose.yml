@@ -16,3 +16,16 @@ services:
       interval: 30s
       timeout: 5s
       start_period: 40s
+
+  # Login/captcha pelo navegador: docker compose stop verify && docker compose --profile login up login
+  # Acesse via túnel SSH: ssh -L 6080:localhost:6080 usuario@servidor -> http://localhost:6080/vnc.html?autoconnect=1
+  # Termina sozinho após o login (sessão salva em profile/); depois: docker compose start verify
+  login:
+    profiles: ["login"]
+    build: .
+    command: ["./login.sh"]
+    ports: ["127.0.0.1:6080:6080"]  # só localhost do servidor: nunca expor o noVNC (sem senha) na internet
+    volumes:
+      - ./profile:/app/profile  # mesmo perfil do verify; não rodar os dois ao mesmo tempo (lock do Firefox)
+    shm_size: "2gb"
+    init: true

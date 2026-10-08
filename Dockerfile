@@ -14,7 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ gcc libc6-d
     && python -m camoufox fetch \
     && find /root/.cache/camoufox/browsers -name version.json | grep -q . \
     && apt-get purge -y g++ gcc libc6-dev libzstd-dev && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-COPY app.py .
+# modo login: VNC + noVNC para logar/resolver captcha pelo navegador (camada após o fetch para não refazer o download)
+RUN apt-get update && apt-get install -y --no-install-recommends x11vnc novnc websockify \
+    && rm -rf /var/lib/apt/lists/*
+COPY app.py login.py login.sh ./
 
 # um único worker: o perfil do Firefox (profile/) só aceita um processo
 # ponytail: roda como root; não-root exigiria acertar permissões do volume profile/ vindo do host
