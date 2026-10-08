@@ -119,7 +119,7 @@ async def lifespan(_):
     if not API_TOKEN:
         logging.getLogger("uvicorn.error").warning("API_TOKEN não definido: API sem autenticação")
     # headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela
-    async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile") as ctx:
+    async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR") as ctx:
         browser_ctx = ctx
         yield
 

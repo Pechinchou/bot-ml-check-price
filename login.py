@@ -10,9 +10,9 @@ LOGIN_TIMEOUT_S = 900
 
 
 async def main():
-    async with AsyncCamoufox(headless=False, persistent_context=True, user_data_dir="profile") as ctx:
+    async with AsyncCamoufox(headless=False, persistent_context=True, user_data_dir="profile", locale="pt-BR") as ctx:
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await page.goto("https://www.mercadolivre.com.br/login", wait_until="domcontentloaded")
+        await page.goto("https://www.mercadolivre.com.br/", wait_until="domcontentloaded")  # /login não existe: clique em "Entre" na home
         print("Aguardando login na tela virtual (noVNC)...", flush=True)
         for _ in range(LOGIN_TIMEOUT_S // 3):
             if await page.query_selector(SEL_LOGGED_IN):
