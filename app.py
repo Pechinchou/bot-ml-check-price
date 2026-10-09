@@ -37,6 +37,8 @@ SEL_ADD_COUPON_LINK = "text=Inserir código >> visible=true"
 SEL_ADD_COUPON_INPUT = "input[placeholder*='código do cupom' i]"
 SEL_CAPTCHA = "iframe[src*='recaptcha'], .g-recaptcha, #captcha, [class*='captcha']"
 CAPTCHA_WAIT_S = 120
+HOME_URL = "https://www.mercadolivre.com.br/"
+LOGIN_MARKERS = ("login", "registration", "/gz/account-verification")  # páginas que pedem login (não são captcha)
 BLOCK_PATHS = ("/gz/account-verification", "/captcha/wall", "/verify/traffic", "/verify/captcha")
 ALLOWED_HOSTS = ("mercadolivre.com.br", "mercadolivre.com", "meli.la")  # evita SSRF: o navegador do servidor só abre o ML
 API_TOKEN = os.getenv("API_TOKEN", "")
@@ -44,15 +46,20 @@ SLOTS = int(os.getenv("SLOTS", "1"))
 MIN_GAP_S = float(os.getenv("MIN_GAP_S", "10"))  # intervalo mínimo entre aberturas de produto (reduz recaptcha)
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "150"))
 ELIGIBLE_TTL_S = 1800
+SESSION_CACHE_TTL_S = float(os.getenv("SESSION_CACHE_TTL_S", "30"))  # /session: resposta reaproveitada p/ não abrir uma janela por chamada
+SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
 
 browser_ctx = None
+main_page = None  # janela única mostrada ao operador no noVNC (cada new_page() abriria outra janela por cima)
 slots = asyncio.Semaphore(SLOTS)  # ponytail: navegador único; escalar com mais perfis só se precisar
 gap_lock, last_start = asyncio.Lock(), 0.0
 eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; só guarda "elegível"
 captcha_free = asyncio.Event()
 captcha_free.set()
 coupons_cache = (0.0, {})  # (timestamp, {code: cupom})
-captcha_state = {"needed": False, "blocked_url": None, "since": None, "session": None}  # 1 sessão de resolução por vez
+session_cache = (0.0, None)  # (timestamp, logged_in)
+session_lock = asyncio.Lock()  # uma checagem por vez: chamadas simultâneas esperam e reaproveitam o resultado
+captcha_state = {"needed": False, "reason": None, "blocked_url": None, "since": None, "session": None}  # reason: "captcha"|"login"; 1 sessão por vez
 store_cache: dict[str, tuple[float, dict]] = {}  # ponytail: sem limpeza ativa, só sobrescreve; adicionar varredura se houver muitas URLs distintas
 store_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # 1 consulta por URL, mesmo em lote
 
@@ -79,6 +86,36 @@ def host_allowed(url: str) -> bool:
     u = urlparse(url.strip())
     host = (u.hostname or "").lower()
     return u.scheme in ("http", "https") and any(host == d or host.endswith("." + d) for d in ALLOWED_HOSTS)
+
+
+def is_login_url(url: str) -> bool:
+    return any(m in url for m in LOGIN_MARKERS)
+
+
+def flag_blocked(reason: str, url: str):
+    """O dashboard vê isso em /captcha/status: reason=captcha (resolver a verificação) ou login (entrar na conta)."""
+    captcha_state.update(needed=True, reason=reason, blocked_url=url, since=captcha_state["since"] or time.time())
+
+
+def clear_blocked():
+    captcha_state.update(needed=False, reason=None, since=None)
+
+
+def html_logged_in(html: str) -> bool:
+    """A home logada traz o menu do usuário; a deslogada traz o link "Entre"."""
+    return "nav-header-user-myml" in html
+
+
+def has_login_cookies(cookies: list[dict]) -> bool:
+    """Cookies que só existem com a conta logada (a deslogada tem `ftid` e `orguseridp`, mas não estes)."""
+    names = {c["name"] for c in cookies}
+    return {"ssid", "orguserid"} <= names
+
+
+def login_step(seen_out: bool, menu: bool) -> tuple[bool, bool]:
+    """(já_viu_deslogado, terminou). Só termina com o menu presente DEPOIS de ter visto a tela deslogada:
+    em `force` a pessoa já começa logada, e o menu de antes do logout não pode contar como login novo."""
+    return seen_out or not menu, menu and seen_out
 
 
 def final_verdict(price: float, informed: float, coupon_final: float | None) -> tuple[float, bool]:
@@ -136,7 +173,7 @@ def require_token(authorization: str = Header(None), x_api_token: str = Header(N
 
 @asynccontextmanager
 async def lifespan(_):
-    global browser_ctx
+    global browser_ctx, main_page
     if not API_TOKEN:
         logging.getLogger("uvicorn.error").warning("API_TOKEN não definido: API sem autenticação")
     # headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela
@@ -144,6 +181,7 @@ async def lifespan(_):
                              # fechar a última aba (ex. pela tela do noVNC) não pode encerrar o navegador do servidor
                              firefox_user_prefs={"browser.tabs.closeWindowWithLastTab": False}) as ctx:
         browser_ctx = ctx
+        main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         closing = {"on": False}
 
         def on_browser_close(*_):
@@ -162,6 +200,14 @@ async def lifespan(_):
 
 app = FastAPI(lifespan=lifespan)  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
 api = APIRouter(dependencies=[Depends(require_token)])
+
+
+async def light_page():
+    """Página para leitura em segundo plano: bloqueia imagens, fontes e mídia (a home do ML é pesada e a VM tem pouca CPU)."""
+    page = await browser_ctx.new_page()
+    await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "media", "font")
+                     else route.continue_())
+    return page
 
 
 async def has_captcha(page) -> str:
@@ -226,7 +272,7 @@ async def load_coupons(force: bool = False) -> dict:
     ts, cache = coupons_cache
     if not force and time.time() - ts < COUPONS_TTL_S:
         return cache
-    page = await browser_ctx.new_page()
+    page = await light_page()
     try:
         await page.goto(COUPONS_URL, wait_until="domcontentloaded")
         await page.wait_for_selector("text=Meus cupons", timeout=15000)
@@ -274,7 +320,7 @@ async def coupon_eligible(item_id: str | None, price: float, loyalty: str, code:
         return None
     if key in eligible_cache and fresh(eligible_cache[key], time.time(), ELIGIBLE_TTL_S):
         return True
-    page = await browser_ctx.new_page()
+    page = await light_page()
     try:
         await page.goto(f"https://www.mercadolivre.com.br/cupons/pdp?item_id={item_id}&unit_price={price}"
                         f"&quantity=1&loyalty={loyalty}&new_version=true", wait_until="domcontentloaded")
@@ -306,23 +352,24 @@ async def fetch_store(url: str) -> dict:
     await captcha_free.wait()
     async with slots:
         await pace()
-        page = await browser_ctx.new_page()
+        page = await light_page()
         try:
             await page.goto(url, wait_until="domcontentloaded")
             if not host_allowed(page.url):
                 return {"status": "invalid_link"}
-            if "login" in page.url or "registration" in page.url:
-                return {"status": "login_required"}
+            if is_login_url(page.url):  # sessão caiu: o ML manda p/ /gz/account-verification ou login
+                flag_blocked("login", HOME_URL)
+                return {"status": "login_required", "detail": f"url: {page.url}"}
             if reason := await has_captcha(page):
                 if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
-                    captcha_state.update(needed=True, blocked_url=url, since=captcha_state["since"] or time.time())
+                    flag_blocked("captcha", url)
                     return {"status": "captcha", "detail": reason}
                 if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
                     return {"status": "captcha", "detail": reason}
             price, html = await read_price(page), await page.content()
             if price is None:
                 return {"status": "not_found"}
-            captcha_state.update(needed=False, since=None)  # leitura normal: o bloqueio passou
+            clear_blocked()  # leitura normal: o bloqueio passou
             ids = Counter(re.findall(r'"item_id":"(MLB\d+)"', html))  # a oferta vencedora é a mais citada
             loyalty = re.search(r'"loyalty_level":(\d+)', html)  # a rota de cupons do produto exige o nível
             return {"status": "ok", "price": price, "item_id": ids.most_common(1)[0][0] if ids else None,
@@ -381,14 +428,71 @@ async def run(item: Item) -> dict:
         return {"status": "timeout"}
 
 
-@api.get("/session")
-async def session():
-    page = await browser_ctx.new_page()
+async def logged_in_quick() -> bool | None:
+    """Home por requisição com os cookies do navegador (não abre janela). Só serve como evidência POSITIVA:
+    o menu pode ser montado no navegador e faltar no HTML inicial, então a ausência dele não prova deslogado (None)."""
     try:
-        await page.goto("https://www.mercadolivre.com.br", wait_until="domcontentloaded")
-        return {"logged_in": await page.query_selector(SEL_LOGGED_IN) is not None}
+        r = await browser_ctx.request.get(HOME_URL, timeout=15000)
+        return True if html_logged_in(await r.text()) else None
+    except Exception:
+        return None
+
+
+async def menu_on(page) -> bool:
+    """O menu do usuário está na página? É o que o navegador mostra de verdade (cookies velhos não enganam)."""
+    try:
+        return bool(page and await page.query_selector(SEL_LOGGED_IN))
+    except Exception:
+        return False  # janela fechada/navegando
+
+
+async def logged_in_signal(page) -> bool:
+    """Sinais baratos de login, sem navegar nem abrir janelas."""
+    try:
+        if page and await page.query_selector(SEL_LOGGED_IN):
+            return True
+    except Exception:
+        pass  # janela fechada/navegando: segue para os outros sinais
+    if has_login_cookies(await browser_ctx.cookies()):
+        return True
+    return bool(await logged_in_quick())
+
+
+async def is_logged_in() -> bool:
+    page = await light_page()
+    try:
+        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        # o header é montado depois do DOMContentLoaded: espera o menu (logado) ou o link "Entre" (deslogado)
+        await page.wait_for_selector(f"{SEL_LOGGED_IN}, a[data-link-id='login']", timeout=12000)
+        return await page.query_selector(SEL_LOGGED_IN) is not None
     finally:
         await page.close()
+
+
+@api.get("/session")
+async def session(refresh: bool = False):
+    """refresh=true ignora o cache de SESSION_CACHE_TTL_S."""
+    global session_cache
+    s = captcha_state["session"]
+    if s and s["status"] == "pending":  # alguém usa a tela: responde sem abrir janela (menu na janela do operador)
+        logged = await menu_on(main_page)
+    else:
+        async with session_lock:
+            ts, cached = session_cache
+            if not refresh and cached is not None and fresh(ts, time.time(), SESSION_CACHE_TTL_S):
+                return {"logged_in": cached, "cached": True}
+            try:
+                logged = await asyncio.wait_for(is_logged_in(), SESSION_TIMEOUT_S)
+            except Exception as e:  # trava/timeout (CPU saturada, home lenta): responde em vez de pendurar o chamador
+                if cached is not None:  # último valor conhecido, marcado como antigo
+                    return {"logged_in": cached, "cached": True, "stale": True}
+                raise HTTPException(504, f"não deu para checar o login: {type(e).__name__}")
+            session_cache = (time.time(), logged)
+    if not logged:
+        flag_blocked("login", HOME_URL)  # deslogado: o dashboard já mostra o alerta, sem esperar um /check falhar
+    elif captcha_state["reason"] == "login":
+        clear_blocked()
+    return {"logged_in": logged, "cached": False}
 
 
 @api.post("/check")
@@ -412,53 +516,127 @@ def vnc_url(token: str) -> str:
     return f"{PUBLIC_BASE_URL}/vnc/{token}/vnc.html?autoconnect=1&resize=scale&path=websockify"
 
 
+async def end_session(s: dict, status: str, detail: str = ""):
+    """Encerra a sessão. A janela do operador é reaproveitada: volta a about:blank em vez de fechar."""
+    s.update(status=status, detail=detail)
+    try:
+        await s["page"].goto("about:blank")
+    except Exception:
+        pass
+
+
+def clear_account_caches():
+    """Depois de um login a conta pode ser outra: os caches (cupons, produtos, elegibilidade) ficam inválidos."""
+    global coupons_cache, session_cache
+    coupons_cache = (0.0, {})
+    session_cache = (0.0, None)
+    store_cache.clear()
+    eligible_cache.clear()
+
+
 async def watch_session(s: dict):
-    """Resolvida quando a página sai da parede de captcha e mostra produto/menu logado; expira após o TTL."""
+    """Captcha: resolvida quando a página sai da parede de captcha/login E a conta está logada."""
     page = s["page"]
     try:
         while time.time() < s["expires_at"]:
             await asyncio.sleep(3)
-            if not await has_captcha(page) and await page.query_selector(f"{SEL_PRICE_META}, {SEL_LOGGED_IN}"):
+            if await has_captcha(page) or is_login_url(page.url):
+                continue
+            if await logged_in_signal(page):
                 await asyncio.sleep(5)  # deixa os cookies serem gravados no perfil
-                s["status"] = "solved"
-                captcha_state.update(needed=False, since=None)
-                return
-        s["status"] = "expired"
+                clear_blocked()
+                return await end_session(s, "solved")
+        await end_session(s, "expired")
     except Exception as e:
-        s.update(status="expired", detail=str(e))
-    finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
+        await end_session(s, "expired", str(e))
+
+
+async def watch_login(s: dict):
+    """Login: resolvida quando o MENU DO USUÁRIO aparece na janela do operador (e, com force, só depois de a pessoa
+    ter saído da conta). Não navega nem abre janelas; cookies sozinhos não bastam (podem estar velhos)."""
+    page = s["page"]
+    seen_out = not s["force"]  # sem force a pessoa começa deslogada; com force ainda está logada
+    try:
+        while time.time() < s["expires_at"]:
+            await asyncio.sleep(3)
+            seen_out, done = login_step(seen_out, await menu_on(page))
+            if done:
+                await asyncio.sleep(5)  # deixa os cookies serem gravados no perfil
+                clear_blocked()
+                clear_account_caches()
+                return await end_session(s, "solved")
+        await end_session(s, "expired")
+    except Exception as e:
+        await end_session(s, "expired", str(e))
 
 
 @api.get("/captcha/status")
 async def captcha_status():
     s = captcha_state["session"]
-    return {"needed": captcha_state["needed"], "blocked_url": captcha_state["blocked_url"],
-            "since": captcha_state["since"], "session": {"id": s["id"], "status": s["status"]} if s else None}
+    return {"needed": captcha_state["needed"], "reason": captcha_state["reason"],
+            "blocked_url": captcha_state["blocked_url"], "since": captcha_state["since"],
+            "session": {"id": s["id"], "kind": s["kind"], "status": s["status"]} if s else None}
+
+
+async def open_session(kind: str, url: str, force: bool = False) -> dict:
+    """Abre (ou devolve) a sessão do operador na janela única. kind: "captcha" ou "login"."""
+    global main_page
+    s = captcha_state["session"]
+    if s and s["status"] == "pending":
+        return s
+    if main_page is None or main_page.is_closed():
+        main_page = await browser_ctx.new_page()
+    page = main_page
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        if kind == "login":  # a home tem o link "Entre" (login real do ML, com client_id): vai direto ao href
+            try:
+                href = await page.get_attribute('a[data-link-id="login"]', "href", timeout=8000)
+                if href and host_allowed(href):
+                    await page.goto(href, wait_until="domcontentloaded")
+            except Exception:
+                pass  # fica na home: a pessoa clica em "Entre"
+        await page.bring_to_front()
+    except Exception as e:
+        raise HTTPException(502, f"não abriu a página: {e}")
+    s = {"id": secrets.token_hex(8), "kind": kind, "token": secrets.token_urlsafe(32), "status": "pending",
+         "detail": "", "expires_at": time.time() + CAPTCHA_SESSION_TTL_S, "page": page, "force": force}
+    captcha_state["session"] = s
+    s["task"] = asyncio.create_task((watch_login if kind == "login" else watch_session)(s))  # referência forte: senão o GC pode matar a tarefa
+    return s
+
+
+def session_reply(s: dict) -> dict:
+    return {"id": s["id"], "kind": s["kind"], "url": vnc_url(s["token"]), "expires_in": int(s["expires_at"] - time.time())}
 
 
 @api.post("/captcha/session")
 async def captcha_session(req: CaptchaReq | None = None):
+    url = (req.url if req and req.url else captcha_state["blocked_url"]) or HOME_URL
+    if not host_allowed(url):
+        raise HTTPException(422, "url deve ser do Mercado Livre")
+    return session_reply(await open_session("captcha", url))
+
+
+class LoginReq(BaseModel):
+    force: bool = False  # abrir mesmo logado (trocar de conta)
+
+
+@api.post("/login/session")
+async def login_session(req: LoginReq | None = None):
     s = captcha_state["session"]
-    if not (s and s["status"] == "pending"):
-        url = (req.url if req and req.url else captcha_state["blocked_url"]) or "https://www.mercadolivre.com.br/"
-        if not host_allowed(url):
-            raise HTTPException(422, "url deve ser do Mercado Livre")
-        page = await browser_ctx.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded")
-            await page.bring_to_front()
-        except Exception as e:
-            await page.close()
-            raise HTTPException(502, f"não abriu a página: {e}")
-        s = {"id": secrets.token_hex(8), "token": secrets.token_urlsafe(32), "status": "pending", "detail": "",
-             "expires_at": time.time() + CAPTCHA_SESSION_TTL_S, "page": page}
-        captcha_state["session"] = s
-        s["task"] = asyncio.create_task(watch_session(s))  # referência forte: senão o GC pode matar a tarefa
-    return {"id": s["id"], "url": vnc_url(s["token"]), "expires_in": int(s["expires_at"] - time.time())}
+    if not (s and s["status"] == "pending") and not (req and req.force):
+        if await is_logged_in():
+            return {"already_logged_in": True}
+    return session_reply(await open_session("login", HOME_URL, force=bool(req and req.force)))
+
+
+@api.get("/login/session/{sid}")
+async def login_session_status(sid: str):
+    s = captcha_state["session"]
+    if not s or s["id"] != sid or s["kind"] != "login":
+        raise HTTPException(404, "sessão não encontrada")
+    return {"status": s["status"], "logged_in": s["status"] == "solved", "detail": s["detail"]}
 
 
 @api.get("/captcha/session/{sid}")

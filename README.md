@@ -15,6 +15,7 @@ persistente** (`profile/`) com a sessão logada, e o captcha pode ser resolvido 
 3. [Rodar com Docker (recomendado)](#rodar-com-docker-recomendado)
 4. [Login no Mercado Livre](#login-no-mercado-livre)
 5. [Captcha pelo dashboard](#captcha-pelo-dashboard)
+   - [Login pelo dashboard](#login-pelo-dashboard)
 6. [Endpoints](#endpoints)
 7. [Regras de negócio](#regras-de-negócio)
 8. [Produção: checklist](#produção-checklist)
@@ -56,6 +57,8 @@ Copie `.env.example` para `.env` e ajuste. O compose lê o `.env` automaticament
 | `MIN_GAP_S` | `10` | Segundos mínimos entre o início de duas leituras. Aumente se o captcha aparecer muito. |
 | `REQUEST_TIMEOUT_S` | `150` | Prazo total de cada requisição (`status: timeout`). |
 | `CAPTCHA_SESSION_TTL_S` | `900` | Validade do link de captcha (15 min). |
+| `SESSION_CACHE_TTL_S` | `30` | Por quanto tempo o `/session` reaproveita a última resposta (evita abrir uma janela por chamada). |
+| `SESSION_TIMEOUT_S` | `25` | Limite da checagem do `/session`. |
 
 > O `docker-compose.yml` já fixa `HEADLESS=display` para o serviço `verify`.
 
@@ -148,11 +151,16 @@ gerar um link para quem estiver de plantão resolver. Requer `HEADLESS=display` 
 
 **Fluxo**
 
-1. `GET /captcha/status` → `needed: true` (o dashboard mostra o alerta e o botão).
-2. Botão → `POST /captcha/session` (sem corpo: abre o produto que bloqueou) → devolve `{id, url, expires_in}`.
-3. A pessoa abre o `url` no navegador, vê o navegador do servidor, resolve o captcha e **fecha só a aba dela**.
-4. O dashboard consulta `GET /captcha/session/{id}` → `pending` → `solved` (ou `expired`).
-5. O próximo `/check` volta a `ok`.
+1. `GET /captcha/status` → `needed: true` e `reason`:
+   - `"captcha"`: o Mercado Livre pediu verificação (a sessão abre o produto que bloqueou);
+   - `"login"`: a conta está deslogada. Use o [login pelo dashboard](#login-pelo-dashboard) (`POST /login/session`).
+2. Botão → `POST /captcha/session` (sem corpo) → devolve `{id, url, expires_in}`.
+3. A pessoa abre o `url` no navegador, vê o navegador do servidor, resolve o captcha (ou faz o login) e **fecha só a aba dela**.
+4. O dashboard consulta `GET /captcha/session/{id}` → `pending` → `solved` (ou `expired`). A sessão só vira `solved`
+   quando a página saiu do bloqueio **e a conta está logada**.
+5. O próximo `/check` volta a `ok`, e `/captcha/status` volta a `needed: false`.
+
+> O `/session` (e o `/check`) deslogado já acendem o alerta: o dashboard não precisa esperar um erro para saber.
 
 ```bash
 curl -H 'X-Api-Token: <token>' localhost:8000/captcha/status
@@ -174,6 +182,32 @@ curl -H 'X-Api-Token: <token>' localhost:8000/captcha/session/<id>
 - Para testar a infraestrutura sem captcha real, abra uma sessão com
   `{"url":"https://www.mercadolivre.com.br/captcha/wall/teste"}` (a sessão fica pendente). Para encerrar, abra
   um produto normal na tela do noVNC.
+- O navegador do servidor mostra **uma única janela** ao operador. A API não abre outras janelas enquanto há
+  uma sessão pendente (o `/session` responde por requisição, sem janela), para a tela não ficar piscando/em branco.
+
+### Login pelo dashboard
+
+Para entrar (ou **trocar**) a conta do Mercado Livre sem terminal, no mesmo molde do captcha:
+
+1. `POST /login/session` → `{id, kind: "login", url, expires_in}`. Corpo opcional `{"force": true}`.
+   - Já logado e sem `force`: devolve `{"already_logged_in": true}` e não abre nada.
+   - `force: true` abre mesmo logado: serve para **trocar de conta** (a pessoa sai e entra com outra).
+2. A pessoa abre o `url`: o navegador do servidor já abre na **página de login** do Mercado Livre. Ela digita o
+   e-mail/telefone, a senha, resolve o captcha e o 2FA, se houver.
+3. O dashboard consulta `GET /login/session/{id}` → `{status, logged_in}`: `pending` → `solved` (`logged_in: true`)
+   ou `expired` (15 min). A API detecta o login sem navegar nem abrir janelas: o sinal é o **menu do usuário na janela
+   do operador** (cookies sozinhos não bastam, podem estar velhos). Com `force`, ela só marca `solved` depois de ver
+   a conta **sair** e **entrar** de novo; por isso, na troca de conta, a pessoa precisa clicar em **Sair** antes.
+4. Ao terminar, a API **limpa os caches** de cupons e produtos (a conta pode ter mudado) e o `/captcha/status`
+   volta a `needed: false`.
+
+```bash
+curl -X POST localhost:8000/login/session -H 'X-Api-Token: <token>'
+curl -X POST localhost:8000/login/session -H 'X-Api-Token: <token>' -H 'content-type: application/json' -d '{"force": true}'
+curl -H 'X-Api-Token: <token>' localhost:8000/login/session/<id>
+```
+
+Só há **uma sessão do operador por vez** (captcha ou login). Se já existe uma pendente, a rota devolve a existente.
 
 ---
 
@@ -184,12 +218,14 @@ Todas as rotas abaixo exigem o token (`X-Api-Token` ou `Authorization: Bearer`).
 
 | Método | Rota | Descrição |
 |---|---|---|
-| `GET` | `/session` | `{"logged_in": true/false}`: o perfil está logado? |
+| `GET` | `/session` | `{"logged_in": true/false, "cached": bool}`: o perfil está logado? A resposta é reaproveitada por `SESSION_CACHE_TTL_S` (30 s); use `?refresh=true` para forçar. Chamadas simultâneas dividem uma só checagem; se passar de `SESSION_TIMEOUT_S` (25 s) devolve o último valor com `stale: true` (ou 504 se nunca checou). Se estiver deslogado, também marca `needed: true` com `reason: "login"` em `/captcha/status`. |
 | `POST` | `/check` | Confere um produto. |
 | `POST` | `/check/batch` | Confere vários (lista de itens). |
-| `GET` | `/captcha/status` | Há bloqueio? `{needed, blocked_url, since, session}`. |
+| `GET` | `/captcha/status` | Há bloqueio? `{needed, reason, blocked_url, since, session}`. `reason` é `"captcha"` (verificação) ou `"login"` (conta deslogada). |
 | `POST` | `/captcha/session` | Cria a sessão/link de captcha. Corpo opcional `{"url": "..."}`. |
 | `GET` | `/captcha/session/{id}` | `pending` · `solved` · `expired`. |
+| `POST` | `/login/session` | Abre o link do noVNC já na página de login. Corpo opcional `{"force": true}` (trocar de conta). |
+| `GET` | `/login/session/{id}` | `{status, logged_in}`: `pending` · `solved` · `expired`. |
 
 ### `POST /check`
 
@@ -240,7 +276,7 @@ Resposta de exemplo:
 | `coupon_expired` / `coupon_sold_out` | Cupom vencido / esgotado. |
 | `coupon_unverified` | Resposta inconclusiva (ex.: "já foi adicionado", lista de cupons não carregou). |
 | `captcha` | Mercado Livre pediu verificação (veja [Captcha](#captcha-pelo-dashboard)). |
-| `login_required` | A sessão caiu: refaça o [login](#login-no-mercado-livre). |
+| `login_required` | A conta está deslogada (o Mercado Livre manda para `/gz/account-verification` ou login). Refaça o [login](#login-no-mercado-livre) ou use a sessão do dashboard. `detail` traz a URL. |
 | `not_found` | Não achou o preço na página. |
 | `invalid_link` | A URL saiu dos domínios permitidos. |
 | `timeout` | Passou do `REQUEST_TIMEOUT_S`. |
@@ -311,7 +347,7 @@ cp .env.example .env                         # HEADLESS=0 abre a janela do naveg
 | Sintoma | Causa provável e solução |
 |---|---|
 | `compose` recusa subir / API sem token | Defina `API_TOKEN` no `.env`. Sem ele a API fica aberta (e o log avisa). |
-| `/session` → `logged_in: false` | Sessão caiu ou nunca foi feita: refaça o [login](#login-no-mercado-livre). |
+| `/session` → `logged_in: false` | Sessão caiu ou nunca foi feita. `/captcha/status` mostra `reason: "login"`. Use o [login pelo dashboard](#login-pelo-dashboard) (`POST /login/session`) ou refaça o [login](#login-no-mercado-livre). |
 | `/check` → `captcha` | Use o [fluxo de captcha](#captcha-pelo-dashboard). O campo `detail` mostra se foi URL de bloqueio ou elemento da página. Se for frequente, aumente `MIN_GAP_S`. |
 | 500 com `TargetClosedError ... browser has been closed` | O navegador do servidor fechou. A API reinicia o processo sozinha (≈15 s). Se não reiniciar, `docker compose restart verify`. |
 | Link do noVNC → 404 | A sessão não está mais `pending` (resolvida, expirada, ou o container reiniciou). Gere outra. |

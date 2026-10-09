@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app import coupon_failure, compare, discount, final_verdict, fresh, host_allowed, parse_price, safe_static_path, session_valid
+from app import coupon_failure, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, login_step, parse_price, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -35,4 +35,15 @@ with tempfile.TemporaryDirectory() as d:
 S = {"token": "abc", "status": "pending", "expires_at": 100}
 assert session_valid(S, "abc", 99) and not session_valid(S, "abc", 101) and not session_valid(S, "xyz", 99)
 assert not session_valid({**S, "status": "solved"}, "abc", 99) and not session_valid(None, "abc", 99)
+assert is_login_url("https://www.mercadolivre.com.br/gz/account-verification?go=x") and is_login_url("https://www.mercadolivre.com/jms/mlb/lgz/login")
+assert not is_login_url("https://www.mercadolivre.com.br/natura-homem/p/MLB45871745") and not is_login_url("https://www.mercadolivre.com.br/captcha/wall/x")
+assert has_login_cookies([{"name": "ssid"}, {"name": "orguserid"}, {"name": "ftid"}])
+assert not has_login_cookies([{"name": "ftid"}, {"name": "orguseridp"}, {"name": "_d2id"}])  # deslogado
+assert html_logged_in('<a class="nav-header-user-myml">Leo</a>') and not html_logged_in('<a data-link-id="login">Entre</a>')
+# nomes reais de uma conta logada (perfil de verdade) e de uma deslogada
+assert has_login_cookies([{"name": n} for n in ("ftid", "dsid", "edsid", "nonce_sso", "orgnickp", "orguserid", "orguseridp", "ssid")])
+# login_step: começa deslogado -> termina quando o menu aparece; com force começa logado -> precisa ver o logout antes
+assert login_step(True, False) == (True, False) and login_step(True, True) == (True, True)
+assert login_step(False, True) == (False, False)  # force: menu de antes do logout não conta
+assert login_step(False, False) == (True, False) and login_step(*login_step(False, False)[:1], True) == (True, True)
 print("ok")
