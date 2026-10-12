@@ -48,6 +48,8 @@ REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "150"))
 ELIGIBLE_TTL_S = 1800
 SESSION_CACHE_TTL_S = float(os.getenv("SESSION_CACHE_TTL_S", "30"))  # /session: resposta reaproveitada p/ não abrir uma janela por chamada
 SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
+WATCHDOG_INTERVAL_S = float(os.getenv("WATCHDOG_INTERVAL_S", "60"))
+WATCHDOG_TIMEOUT_S = float(os.getenv("WATCHDOG_TIMEOUT_S", "20"))
 
 browser_ctx = None
 main_page = None  # janela única mostrada ao operador no noVNC (cada new_page() abriria outra janela por cima)
@@ -68,6 +70,37 @@ def parse_price(text: str) -> float:
     """'R$ 1.299,90' -> 1299.9 ; '199' -> 199.0"""
     digits = re.sub(r"[^\d,]", "", text.replace(".", ""))
     return float(digits.replace(",", "."))
+
+
+async def bounded(coro, timeout: float):
+    """Como wait_for, mas NÃO espera o cancelamento: com o Firefox travado, o `finally: page.close()` da tarefa
+    nunca volta e o wait_for pendurava junto (preso no session_lock/slots)."""
+    task = asyncio.ensure_future(coro)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        raise asyncio.TimeoutError
+    return task.result()
+
+
+async def probe_browser():
+    page = await browser_ctx.new_page()
+    await page.close()
+
+
+async def watchdog():
+    """Navegador pendurado não dispara o evento `close`: se abrir/fechar uma aba falhar 2x seguidas, reinicia o processo."""
+    fails = 0
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_S)
+        try:
+            await bounded(probe_browser(), WATCHDOG_TIMEOUT_S)
+            fails = 0
+        except Exception:
+            fails += 1
+            logging.getLogger("uvicorn.error").error("watchdog: navegador não responde (%d/2)", fails)
+            if fails >= 2:
+                os._exit(1)  # Docker (restart: unless-stopped) sobe tudo de novo
 
 
 def fresh(ts: float, now: float, ttl: float) -> bool:
@@ -192,9 +225,11 @@ async def lifespan(_):
                 os._exit(1)
 
         ctx.on("close", on_browser_close)
+        wd = asyncio.create_task(watchdog())
         try:
             yield
         finally:
+            wd.cancel()
             closing["on"] = True  # desligamento normal não é falha
 
 
@@ -423,7 +458,7 @@ async def check(item: Item) -> dict:
 
 async def run(item: Item) -> dict:
     try:
-        return await asyncio.wait_for(check(item), REQUEST_TIMEOUT_S)
+        return await bounded(check(item), REQUEST_TIMEOUT_S)
     except asyncio.TimeoutError:
         return {"status": "timeout"}
 
@@ -482,7 +517,7 @@ async def session(refresh: bool = False):
             if not refresh and cached is not None and fresh(ts, time.time(), SESSION_CACHE_TTL_S):
                 return {"logged_in": cached, "cached": True}
             try:
-                logged = await asyncio.wait_for(is_logged_in(), SESSION_TIMEOUT_S)
+                logged = await bounded(is_logged_in(), SESSION_TIMEOUT_S)
             except Exception as e:  # trava/timeout (CPU saturada, home lenta): responde em vez de pendurar o chamador
                 if cached is not None:  # último valor conhecido, marcado como antigo
                     return {"logged_in": cached, "cached": True, "stale": True}
