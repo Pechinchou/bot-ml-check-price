@@ -50,6 +50,7 @@ SESSION_CACHE_TTL_S = float(os.getenv("SESSION_CACHE_TTL_S", "30"))  # /session:
 SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
 WATCHDOG_INTERVAL_S = float(os.getenv("WATCHDOG_INTERVAL_S", "60"))
 WATCHDOG_TIMEOUT_S = float(os.getenv("WATCHDOG_TIMEOUT_S", "20"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "15"))  # abas abertas acima disso = vazamento (cada uma é um processo do Firefox)
 
 browser_ctx = None
 main_page = None  # janela única mostrada ao operador no noVNC (cada new_page() abriria outra janela por cima)
@@ -93,6 +94,12 @@ async def watchdog():
     fails = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
+        urls = [p.url[:80] for p in browser_ctx.pages]
+        if len(urls) > 4:  # normal: 1 janela do operador + até ~3 leituras/cupons em andamento
+            logging.getLogger("uvicorn.error").warning("watchdog: %d abas abertas: %s", len(urls), urls)
+        if len(urls) > MAX_PAGES:
+            logging.getLogger("uvicorn.error").error("watchdog: abas demais (vazamento): reiniciando")
+            os._exit(1)
         try:
             await bounded(probe_browser(), WATCHDOG_TIMEOUT_S)
             fails = 0
@@ -240,8 +247,12 @@ api = APIRouter(dependencies=[Depends(require_token)])
 async def light_page():
     """Página para leitura em segundo plano: bloqueia imagens, fontes e mídia (a home do ML é pesada e a VM tem pouca CPU)."""
     page = await browser_ctx.new_page()
-    await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "media", "font")
-                     else route.continue_())
+    try:
+        await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "media", "font")
+                         else route.continue_())
+    except BaseException:
+        await page.close()  # senão a aba vazaria (cada uma é um processo do Firefox)
+        raise
     return page
 
 

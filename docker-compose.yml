@@ -8,6 +8,8 @@ services:
     volumes:
       - ./profile:/app/profile  # sessão logada do Mercado Livre (logar no Mac e copiar a pasta)
     shm_size: "2gb"  # Firefox trava com o /dev/shm padrão de 64 MB
+    mem_limit: 6g    # vazamento do Firefox chegou a 10 GB: estourar o limite reinicia só este container
+    pids_limit: 400
     init: true       # reaper de processos: evita Camoufox órfão segurando o perfil
     restart: unless-stopped
     healthcheck:
