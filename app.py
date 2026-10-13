@@ -85,6 +85,10 @@ async def bounded(coro, timeout: float):
 
 
 async def probe_browser():
+    s = captcha_state["session"]
+    if s and s["status"] == "pending" and not s["page"].is_closed():
+        await s["page"].evaluate("1")  # new_page() abriria uma janela por cima da tela do operador
+        return
     page = await browser_ctx.new_page()
     await page.close()
 
@@ -492,6 +496,20 @@ async def menu_on(page) -> bool:
         return False  # janela fechada/navegando
 
 
+async def menu_on_any() -> bool:
+    """O ML pode terminar o login (pós-2FA) em outra aba/janela: olha todas, não só a do operador."""
+    return any([await menu_on(p) for p in list(browser_ctx.pages)])
+
+
+async def operator_page(s: dict):
+    """Janela do operador da sessão; se ela foi fechada (o ML troca de janela após o 2FA), adota outra aberta."""
+    global main_page
+    if s["page"].is_closed():
+        alive = [p for p in browser_ctx.pages if not p.is_closed()]
+        s["page"] = main_page = alive[-1] if alive else await browser_ctx.new_page()
+    return s["page"]
+
+
 async def logged_in_signal(page) -> bool:
     """Sinais baratos de login, sem navegar nem abrir janelas."""
     try:
@@ -582,10 +600,10 @@ def clear_account_caches():
 
 async def watch_session(s: dict):
     """Captcha: resolvida quando a página sai da parede de captcha/login E a conta está logada."""
-    page = s["page"]
     try:
         while time.time() < s["expires_at"]:
             await asyncio.sleep(3)
+            page = await operator_page(s)
             if await has_captcha(page) or is_login_url(page.url):
                 continue
             if await logged_in_signal(page):
@@ -600,12 +618,16 @@ async def watch_session(s: dict):
 async def watch_login(s: dict):
     """Login: resolvida quando o MENU DO USUÁRIO aparece na janela do operador (e, com force, só depois de a pessoa
     ter saído da conta). Não navega nem abre janelas; cookies sozinhos não bastam (podem estar velhos)."""
-    page = s["page"]
     seen_out = not s["force"]  # sem force a pessoa começa deslogada; com force ainda está logada
     try:
         while time.time() < s["expires_at"]:
             await asyncio.sleep(3)
-            seen_out, done = login_step(seen_out, await menu_on(page))
+            await operator_page(s)
+            urls = [p.url[:100] for p in browser_ctx.pages]
+            if urls != s.get("urls"):  # diagnóstico: mostra para onde o ML levou o login (2FA abre aba nova?)
+                s["urls"] = urls
+                logging.getLogger("uvicorn.error").info("login: abas %s", urls)
+            seen_out, done = login_step(seen_out, await menu_on_any())
             if done:
                 await asyncio.sleep(5)  # deixa os cookies serem gravados no perfil
                 clear_blocked()
@@ -634,6 +656,9 @@ async def open_session(kind: str, url: str, force: bool = False) -> dict:
         main_page = await browser_ctx.new_page()
     page = main_page
     try:
+        for p in list(browser_ctx.pages):  # janelas vazias sobrando cobririam a do operador (leituras em andamento ficam)
+            if p is not page and p.url == "about:blank":
+                await p.close()
         await page.goto(url, wait_until="domcontentloaded")
         if kind == "login":  # a home tem o link "Entre" (login real do ML, com client_id): vai direto ao href
             try:
