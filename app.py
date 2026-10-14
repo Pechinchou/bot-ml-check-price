@@ -411,6 +411,7 @@ async def fetch_store(url: str) -> dict:
                 flag_blocked("login", HOME_URL)
                 return {"status": "login_required", "detail": f"url: {page.url}"}
             if reason := await has_captcha(page):
+                logging.getLogger("uvicorn.error").warning("captcha: %s (%s)", url, reason)
                 if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
                     flag_blocked("captcha", url)
                     return {"status": "captcha", "detail": reason}
@@ -419,7 +420,10 @@ async def fetch_store(url: str) -> dict:
             price, html = await read_price(page), await page.content()
             if price is None:
                 return {"status": "not_found"}
-            clear_blocked()  # leitura normal: o bloqueio passou
+            # leitura normal: o bloqueio passou. Captcha de OUTRA url não se apaga (o alerta sumia com o item ainda bloqueado)
+            if captcha_state["reason"] != "captcha" or captcha_state["blocked_url"] == url \
+                    or time.time() - (captcha_state["since"] or 0) > 600:
+                clear_blocked()
             ids = Counter(re.findall(r'"item_id":"(MLB\d+)"', html))  # a oferta vencedora é a mais citada
             loyalty = re.search(r'"loyalty_level":(\d+)', html)  # a rota de cupons do produto exige o nível
             return {"status": "ok", "price": price, "item_id": ids.most_common(1)[0][0] if ids else None,
