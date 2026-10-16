@@ -162,10 +162,16 @@ def login_step(seen_out: bool, menu: bool) -> tuple[bool, bool]:
     return seen_out or not menu, menu and seen_out
 
 
-def final_verdict(price: float, informed: float, coupon_final: float | None) -> tuple[float, bool]:
-    """Vitrine vence o cupom: se o informado já bate com a vitrine, o ML já exibe o preço com cupom
-    (aplicar de novo daria desconto em dobro). Retorna (preço final, bateu_com_a_vitrine)."""
-    matched = int(price) == int(informed)
+def coupon_in_page(area_text: str, price: float, shown: float | None) -> bool:
+    """A vitrine já traz um cupom aplicado: o rótulo "com Cupom" na área de preço, ou o preço do meta menor que
+    o exibido. ponytail: se a página tiver outro cupom que não o pedido, não empilha nem troca; revisar se ocorrer."""
+    return "com cupom" in area_text.lower() or (shown is not None and price < shown - 0.5)
+
+
+def final_verdict(price: float, informed: float, coupon_final: float | None, in_page: bool = False) -> tuple[float, bool]:
+    """Vitrine vence o cupom: se o informado já bate com a vitrine (ou a página já mostra o cupom), o ML já exibe
+    o preço com cupom (aplicar de novo daria desconto em dobro). Retorna (preço final, bateu_com_a_vitrine)."""
+    matched = in_page or int(price) == int(informed)
     return (price if matched or coupon_final is None else coupon_final), matched
 
 
@@ -281,15 +287,20 @@ async def wait_captcha(page) -> bool:
         captcha_free.set()
 
 
-async def read_price(page) -> float | None:
-    meta = await page.query_selector(SEL_PRICE_META)
-    if meta and (v := await meta.get_attribute("content")):
-        return float(v)
+async def read_shown_price(page) -> float | None:
+    """Preço principal visível na página (pode diferir do meta quando há cupom aplicado)."""
     frac = await page.query_selector(SEL_PRICE_FRACTION)
     if not frac:
         return None
     cents = await page.query_selector(SEL_PRICE_CENTS)
     return parse_price(f"{await frac.inner_text()},{(await cents.inner_text()) if cents else '00'}")
+
+
+async def read_price(page) -> float | None:
+    meta = await page.query_selector(SEL_PRICE_META)
+    if meta and (v := await meta.get_attribute("content")):
+        return float(v)
+    return await read_shown_price(page)
 
 
 def discount(price: float, c: dict) -> tuple[str, float]:
@@ -420,6 +431,11 @@ async def fetch_store(url: str) -> dict:
             price, html = await read_price(page), await page.content()
             if price is None:
                 return {"status": "not_found"}
+            shown, area = await read_shown_price(page), await page.query_selector(".ui-pdp-price")
+            area_text = await area.inner_text() if area else ""
+            in_page = coupon_in_page(area_text, price, shown)
+            logging.getLogger("uvicorn.error").info("preço: meta/lido=%s visível=%s cupom_na_página=%s texto=%r",
+                                                    price, shown, in_page, area_text[:200])  # diagnóstico do "com Cupom"
             # leitura normal: o bloqueio passou. Captcha de OUTRA url não se apaga (o alerta sumia com o item ainda bloqueado)
             if captcha_state["reason"] != "captcha" or captcha_state["blocked_url"] == url \
                     or time.time() - (captcha_state["since"] or 0) > 600:
@@ -427,7 +443,7 @@ async def fetch_store(url: str) -> dict:
             ids = Counter(re.findall(r'"item_id":"(MLB\d+)"', html))  # a oferta vencedora é a mais citada
             loyalty = re.search(r'"loyalty_level":(\d+)', html)  # a rota de cupons do produto exige o nível
             return {"status": "ok", "price": price, "item_id": ids.most_common(1)[0][0] if ids else None,
-                    "loyalty": loyalty.group(1) if loyalty else "0"}
+                    "loyalty": loyalty.group(1) if loyalty else "0", "coupon_in_page": in_page}
         except Exception as e:  # um item com erro não derruba o batch
             return {"status": "error", "detail": str(e)}
         finally:
@@ -470,7 +486,11 @@ async def check(item: Item) -> dict:
                 if out["status"] == "ok":
                     with_coupon = final
                     out.update(coupon_applied=True, price_with_coupon=final)
-    final, out["matched_showcase"] = final_verdict(price, item.price, with_coupon)
+    in_page = store.get("coupon_in_page", False)
+    if in_page and out["status"] == "ok":  # a vitrine já tem o cupom: não desconta de novo
+        out.update(coupon_applied=False, price_with_coupon=price if item.coupon else None)
+        with_coupon = None
+    final, out["matched_showcase"] = final_verdict(price, item.price, with_coupon, in_page)
     out["comparison"] = compare(final, item.price)
     return out
 

@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app import coupon_failure, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, login_step, parse_price, safe_static_path, session_valid
+from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, login_step, parse_price, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -24,6 +24,9 @@ assert not host_allowed("https://mercadolivre.com.br.evil.com/") and not host_al
 assert final_verdict(73.92, 73, 60.0) == (73.92, True)  # vitrine já com cupom: não aplica de novo
 assert final_verdict(100, 50, 90.0) == (90.0, False)
 assert final_verdict(100, 50, None) == (100, False)
+assert final_verdict(2675.2, 2674, 2475.2, in_page=True) == (2675.2, True)  # cupom já na página, R$ 1 de diferença
+assert coupon_in_page("R$ 2.675,20 no Pix com Cupom", 2675.2, 2675.2) and coupon_in_page("", 2675.2, 2875.2)
+assert not coupon_in_page("R$ 100", 100, 100)
 assert coupon_failure("Inserir Erro Confira se o cupom está correto") == "coupon_invalid"
 assert coupon_failure("Este cupom já foi adicionado") == "coupon_unverified"
 assert coupon_failure("O cupom esgotou. Há outros") == "coupon_sold_out"
