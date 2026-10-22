@@ -8,18 +8,18 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from importlib.metadata import version as pkg_version
 
 from camoufox.async_api import AsyncCamoufox
+from camoufox.fingerprints import generate_fingerprint
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Seletores do ML isolados aqui: se o layout mudar, é só ajustar estas constantes.
-SEL_PRICE_META = 'meta[itemprop="price"]'
-SEL_PRICE_FRACTION = ".ui-pdp-price__second-line .andes-money-amount__fraction"
-SEL_PRICE_CENTS = ".ui-pdp-price__second-line .andes-money-amount__cents"
+# Seletores do ML isolados aqui (e em READ_PRODUCT_JS): se o layout mudar, é só ajustar estes pontos.
+SEL_SOCIAL_PRODUCT = "a.poly-component__link--action-link"  # "Ir para produto" na vitrine do afiliado (/social/...)
 SEL_LOGGED_IN = "a.nav-header-user-myml, .nav-header-user-myml, [data-js='user-menu']"
 COUPONS_URL = "https://www.mercadolivre.com.br/cupons/active"
 COUPONS_TTL_S = 300
@@ -51,10 +51,41 @@ SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
 WATCHDOG_INTERVAL_S = float(os.getenv("WATCHDOG_INTERVAL_S", "60"))
 WATCHDOG_TIMEOUT_S = float(os.getenv("WATCHDOG_TIMEOUT_S", "20"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "15"))  # abas abertas acima disso = vazamento (cada uma é um processo do Firefox)
+FINGERPRINT_FILE = Path("profile/fingerprint.json")
+# Cópia do MEMORY_PREFS de apps/verify-bot/src/scrape/browser.ts (repo promo-feed). Ficam gravadas no perfil: tirar uma daqui
+# não volta o valor antigo, é preciso apagar a linha em profile/prefs.js.
+FIREFOX_PREFS = {
+    "dom.ipc.keepProcessesAlive.web": 0, "dom.ipc.keepProcessesAlive.webIsolated": 0,  # sem processo quente após fechar aba
+    "dom.ipc.processPrelaunch.enabled": False,
+    "dom.ipc.processCount": 1, "dom.ipc.processCount.webIsolated": 1,  # default 8; lemos uma página por vez
+    "browser.cache.memory.capacity": 32768,
+    "browser.sessionhistory.max_total_viewers": 0, "browser.sessionhistory.max_entries": 3,  # bfcache: nunca voltamos página
+    "image.mem.surface_cache.max_size_kb": 32768,
+    "browser.cache.disk.capacity": 51200,
+    "places.history.enabled": False,
+    "browser.sessionstore.resume_from_crash": False, "browser.sessionstore.interval": 1_800_000,
+    "network.predictor.enabled": False, "network.prefetch-next": False,
+    "toolkit.telemetry.enabled": False, "datareporting.healthreport.uploadEnabled": False,
+}
+# Preço do meta, preço visível, área de preço e ids do produto numa só ida ao navegador (antes: ~8 + o HTML inteiro p/ Python)
+READ_PRODUCT_JS = """() => {
+    const html = document.documentElement.outerHTML;
+    const q = s => document.querySelector(s);
+    return {
+        meta: q('meta[itemprop="price"]')?.content ?? null,
+        fraction: q('.ui-pdp-price__second-line .andes-money-amount__fraction')?.innerText ?? null,
+        cents: q('.ui-pdp-price__second-line .andes-money-amount__cents')?.innerText ?? null,
+        area: q('.ui-pdp-price')?.innerText ?? '',
+        ids: [...html.matchAll(/"item_id":"(MLB\\d+)"/g)].map(m => m[1]),
+        loyalty: (html.match(/"loyalty_level":(\\d+)/) || [])[1] ?? null,
+    };
+}"""
 
 browser_ctx = None
 main_page = None  # janela única mostrada ao operador no noVNC (cada new_page() abriria outra janela por cima)
-slots = asyncio.Semaphore(SLOTS)  # ponytail: navegador único; escalar com mais perfis só se precisar
+read_pages: asyncio.Queue = asyncio.Queue()  # abas de leitura livres (None = ainda não criada); limita SLOTS leituras em paralelo
+for _ in range(SLOTS):  # ponytail: navegador único; escalar com mais perfis só se precisar
+    read_pages.put_nowait(None)
 gap_lock, last_start = asyncio.Lock(), 0.0
 eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; só guarda "elegível"
 captcha_free = asyncio.Event()
@@ -73,9 +104,32 @@ def parse_price(text: str) -> float:
     return float(digits.replace(",", "."))
 
 
+def parse_product_read(raw: dict) -> tuple[float | None, float | None, str, str | None, str]:
+    """Resultado de READ_PRODUCT_JS -> (preço do meta ou visível, preço visível, texto da área, item_id, loyalty)."""
+    shown = parse_price(f"{raw['fraction']},{raw['cents'] or '00'}") if raw.get("fraction") else None
+    price = float(raw["meta"]) if raw.get("meta") else shown
+    ids = Counter(raw.get("ids") or [])  # a oferta vencedora é a mais citada
+    return price, shown, raw.get("area") or "", ids.most_common(1)[0][0] if ids else None, raw.get("loyalty") or "0"
+
+
+def stored_fingerprint(path: Path, camoufox_version: str, make) -> dict:
+    """Impressão digital fixa entre reinícios (senão o ML via um computador novo a cada um). O arquivo guarda a versão do
+    Camoufox: formato de outra versão derruba o launch, então é regerado se ela mudar."""
+    try:
+        saved = json.loads(path.read_text())
+        if saved.get("camoufox") == camoufox_version:
+            return saved["fingerprint"]
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    fp = make()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"camoufox": camoufox_version, "fingerprint": fp}))
+    return fp
+
+
 async def bounded(coro, timeout: float):
     """Como wait_for, mas NÃO espera o cancelamento: com o Firefox travado, o `finally: page.close()` da tarefa
-    nunca volta e o wait_for pendurava junto (preso no session_lock/slots)."""
+    nunca volta e o wait_for pendurava junto (preso no session_lock/read_pages)."""
     task = asyncio.ensure_future(coro)
     done, _ = await asyncio.wait({task}, timeout=timeout)
     if not done:
@@ -130,6 +184,11 @@ def host_allowed(url: str) -> bool:
     u = urlparse(url.strip())
     host = (u.hostname or "").lower()
     return u.scheme in ("http", "https") and any(host == d or host.endswith("." + d) for d in ALLOWED_HOSTS)
+
+
+def is_social_page(url: str) -> bool:
+    """meli.la de afiliado cai na vitrine do perfil (/social/<perfil>), não na página do produto."""
+    return urlparse(url).path.startswith("/social/")
 
 
 def is_login_url(url: str) -> bool:
@@ -228,8 +287,9 @@ async def lifespan(_):
         logging.getLogger("uvicorn.error").warning("API_TOKEN não definido: API sem autenticação")
     # headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela
     async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR",
-                             # fechar a última aba (ex. pela tela do noVNC) não pode encerrar o navegador do servidor
-                             firefox_user_prefs={"browser.tabs.closeWindowWithLastTab": False}) as ctx:
+                             os="macos", firefox_user_prefs=FIREFOX_PREFS,
+                             fingerprint=stored_fingerprint(FINGERPRINT_FILE, pkg_version("camoufox"),
+                                                            lambda: generate_fingerprint(os="macos"))) as ctx:
         browser_ctx = ctx
         main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         closing = {"on": False}
@@ -266,6 +326,26 @@ async def light_page():
     return page
 
 
+async def read_page():
+    """Aba de leitura reaproveitada: uma janela por slot em vez de uma por /check. Recriada se foi fechada."""
+    page = await read_pages.get()
+    if page is None or page.is_closed():
+        page = await light_page()
+    return page
+
+
+async def release_read_page(page):
+    """Devolve a aba em about:blank (o JS do ML não segue rodando); se não der, descarta e o próximo slot cria outra."""
+    ok = False
+    try:
+        await page.goto("about:blank")
+        ok = True
+    except BaseException:  # inclui cancelamento por timeout: o slot não pode se perder
+        asyncio.ensure_future(page.close())
+    finally:
+        read_pages.put_nowait(page if ok else None)
+
+
 async def has_captcha(page) -> str:
     """O que indicou bloqueio/captcha (vazio = nada); o motivo vai no `detail` da resposta."""
     if "captcha" in page.url or any(p in page.url for p in BLOCK_PATHS):
@@ -285,22 +365,6 @@ async def wait_captcha(page) -> bool:
         return False
     finally:
         captcha_free.set()
-
-
-async def read_shown_price(page) -> float | None:
-    """Preço principal visível na página (pode diferir do meta quando há cupom aplicado)."""
-    frac = await page.query_selector(SEL_PRICE_FRACTION)
-    if not frac:
-        return None
-    cents = await page.query_selector(SEL_PRICE_CENTS)
-    return parse_price(f"{await frac.inner_text()},{(await cents.inner_text()) if cents else '00'}")
-
-
-async def read_price(page) -> float | None:
-    meta = await page.query_selector(SEL_PRICE_META)
-    if meta and (v := await meta.get_attribute("content")):
-        return float(v)
-    return await read_shown_price(page)
 
 
 def discount(price: float, c: dict) -> tuple[str, float]:
@@ -411,43 +475,42 @@ async def fetch_store(url: str) -> dict:
     if (cs := captcha_state["session"]) and cs["status"] == "pending":  # alguém está resolvendo: não enfileira
         return {"status": "captcha", "detail": "verificação em andamento"}
     await captcha_free.wait()
-    async with slots:
+    page = await read_page()
+    try:
         await pace()
-        page = await light_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded")
-            if not host_allowed(page.url):
-                return {"status": "invalid_link"}
-            if is_login_url(page.url):  # sessão caiu: o ML manda p/ /gz/account-verification ou login
-                flag_blocked("login", HOME_URL)
-                return {"status": "login_required", "detail": f"url: {page.url}"}
-            if reason := await has_captcha(page):
-                logging.getLogger("uvicorn.error").warning("captcha: %s (%s)", url, reason)
-                if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
-                    flag_blocked("captcha", url)
-                    return {"status": "captcha", "detail": reason}
-                if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
-                    return {"status": "captcha", "detail": reason}
-            price, html = await read_price(page), await page.content()
-            if price is None:
-                return {"status": "not_found"}
-            shown, area = await read_shown_price(page), await page.query_selector(".ui-pdp-price")
-            area_text = await area.inner_text() if area else ""
-            in_page = coupon_in_page(area_text, price, shown)
-            logging.getLogger("uvicorn.error").info("preço: meta/lido=%s visível=%s cupom_na_página=%s texto=%r",
-                                                    price, shown, in_page, area_text[:200])  # diagnóstico do "com Cupom"
-            # leitura normal: o bloqueio passou. Captcha de OUTRA url não se apaga (o alerta sumia com o item ainda bloqueado)
-            if captcha_state["reason"] != "captcha" or captcha_state["blocked_url"] == url \
-                    or time.time() - (captcha_state["since"] or 0) > 600:
-                clear_blocked()
-            ids = Counter(re.findall(r'"item_id":"(MLB\d+)"', html))  # a oferta vencedora é a mais citada
-            loyalty = re.search(r'"loyalty_level":(\d+)', html)  # a rota de cupons do produto exige o nível
-            return {"status": "ok", "price": price, "item_id": ids.most_common(1)[0][0] if ids else None,
-                    "loyalty": loyalty.group(1) if loyalty else "0", "coupon_in_page": in_page}
-        except Exception as e:  # um item com erro não derruba o batch
-            return {"status": "error", "detail": str(e)}
-        finally:
-            await page.close()
+        await page.goto(url, wait_until="domcontentloaded")
+        if host_allowed(page.url) and is_social_page(page.url):  # vitrine do afiliado: segue o "Ir para produto"
+            href = await page.eval_on_selector(SEL_SOCIAL_PRODUCT, "a => a.href") if await page.query_selector(SEL_SOCIAL_PRODUCT) else None
+            if not href or not host_allowed(href):
+                return {"status": "not_found", "detail": "vitrine do afiliado sem link de produto"}
+            await page.goto(href, wait_until="domcontentloaded")
+        if not host_allowed(page.url):
+            return {"status": "invalid_link"}
+        if is_login_url(page.url):  # sessão caiu: o ML manda p/ /gz/account-verification ou login
+            flag_blocked("login", HOME_URL)
+            return {"status": "login_required", "detail": f"url: {page.url}"}
+        if reason := await has_captcha(page):
+            logging.getLogger("uvicorn.error").warning("captcha: %s (%s)", url, reason)
+            if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
+                flag_blocked("captcha", url)
+                return {"status": "captcha", "detail": reason}
+            if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
+                return {"status": "captcha", "detail": reason}
+        price, shown, area_text, item_id, loyalty = parse_product_read(await page.evaluate(READ_PRODUCT_JS))
+        if price is None:
+            return {"status": "not_found"}
+        in_page = coupon_in_page(area_text, price, shown)
+        logging.getLogger("uvicorn.error").info("preço: meta/lido=%s visível=%s cupom_na_página=%s texto=%r",
+                                                price, shown, in_page, area_text[:200])  # diagnóstico do "com Cupom"
+        # leitura normal: o bloqueio passou. Captcha de OUTRA url não se apaga (o alerta sumia com o item ainda bloqueado)
+        if captcha_state["reason"] != "captcha" or captcha_state["blocked_url"] == url \
+                or time.time() - (captcha_state["since"] or 0) > 600:
+            clear_blocked()
+        return {"status": "ok", "price": price, "item_id": item_id, "loyalty": loyalty, "coupon_in_page": in_page}
+    except Exception as e:  # um item com erro não derruba o batch
+        return {"status": "error", "detail": str(e)}
+    finally:
+        await release_read_page(page)
 
 
 async def get_store(url: str) -> tuple[dict, bool]:
@@ -547,6 +610,8 @@ async def logged_in_signal(page) -> bool:
 
 
 async def is_logged_in() -> bool:
+    if await logged_in_quick():  # evidência positiva por HTTP: dispensa renderizar a home (pesada)
+        return True
     page = await light_page()
     try:
         await page.goto(HOME_URL, wait_until="domcontentloaded")

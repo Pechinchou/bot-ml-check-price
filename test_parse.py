@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, login_step, parse_price, safe_static_path, session_valid
+from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, is_social_page, login_step, parse_price, parse_product_read, stored_fingerprint, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -49,4 +49,19 @@ assert has_login_cookies([{"name": n} for n in ("ftid", "dsid", "edsid", "nonce_
 assert login_step(True, False) == (True, False) and login_step(True, True) == (True, True)
 assert login_step(False, True) == (False, False)  # force: menu de antes do logout não conta
 assert login_step(False, False) == (True, False) and login_step(*login_step(False, False)[:1], True) == (True, True)
+# leitura do produto numa chamada: meta vence; sem meta usa o visível; item_id mais citado; loyalty padrão 0
+assert parse_product_read({"meta": "73.9", "fraction": "74", "cents": "90", "area": "R$ 74", "ids": ["MLB1", "MLB2", "MLB2"], "loyalty": "3"}) \
+    == (73.9, 74.9, "R$ 74", "MLB2", "3")
+assert parse_product_read({"meta": None, "fraction": "1.299", "cents": None, "ids": []}) == (1299.0, 1299.0, "", None, "0")
+assert parse_product_read({"meta": None, "fraction": None, "cents": None})[0] is None
+# impressão digital: gera uma vez, reaproveita, e regera se a versão do Camoufox mudar
+with tempfile.TemporaryDirectory() as d:
+    f, calls = Path(d) / "sub" / "fingerprint.json", []
+    mk = lambda: calls.append(1) or {"n": len(calls)}
+    assert stored_fingerprint(f, "0.5.8", mk) == {"n": 1} and stored_fingerprint(f, "0.5.8", mk) == {"n": 1}
+    assert stored_fingerprint(f, "0.6.0", mk) == {"n": 2}
+    f.write_text("lixo")
+    assert stored_fingerprint(f, "0.6.0", mk) == {"n": 3}
+assert is_social_page("https://www.mercadolivre.com.br/social/promotop?matt_word=x")
+assert not is_social_page("https://www.mercadolivre.com.br/panela/p/MLB68935558?source=affiliate-profile")
 print("ok")
