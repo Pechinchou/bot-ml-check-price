@@ -7,7 +7,7 @@ import secrets
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from importlib.metadata import version as pkg_version
 
 from camoufox.async_api import AsyncCamoufox
@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # Seletores do ML isolados aqui (e em READ_PRODUCT_JS): se o layout mudar, é só ajustar estes pontos.
 SEL_SOCIAL_PRODUCT = "a.poly-component__link--action-link"  # "Ir para produto" na vitrine do afiliado (/social/...)
@@ -46,6 +46,12 @@ SLOTS = int(os.getenv("SLOTS", "1"))
 MIN_GAP_S = float(os.getenv("MIN_GAP_S", "10"))  # intervalo mínimo entre aberturas de produto (reduz recaptcha)
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "150"))
 ELIGIBLE_TTL_S = 1800
+INELIGIBLE_TTL_S = 60  # "não elegível" muda mais (estoque/regra do cupom): cache curto, só p/ não repetir dentro do lote
+MAX_BATCH = int(os.getenv("MAX_BATCH", "100"))  # itens por /check/batch; acima disso 413
+MAX_QUEUE = int(os.getenv("MAX_QUEUE", "200"))  # itens em andamento+esperando; cheio = 503 com Retry-After (em vez de pendurar até estourar)
+TRACKING_PARAMS = ("matt_", "utm_", "reco_")  # prefixos
+TRACKING_NAMES = {"source", "ref", "tracking_id", "sid", "gclid", "fbclid", "forceinapp", "search_layout", "position",
+                  "polycard_client", "type", "is_advertising", "ad_domain", "ad_position", "ad_click_id", "click1"}
 SESSION_CACHE_TTL_S = float(os.getenv("SESSION_CACHE_TTL_S", "30"))  # /session: resposta reaproveitada p/ não abrir uma janela por chamada
 SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
 WATCHDOG_INTERVAL_S = float(os.getenv("WATCHDOG_INTERVAL_S", "60"))
@@ -87,14 +93,17 @@ read_pages: asyncio.Queue = asyncio.Queue()  # abas de leitura livres (None = ai
 for _ in range(SLOTS):  # ponytail: navegador único; escalar com mais perfis só se precisar
     read_pages.put_nowait(None)
 gap_lock, last_start = asyncio.Lock(), 0.0
-eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; só guarda "elegível"
+eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; "elegível"
+ineligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; "não elegível" (TTL curto)
+pending = 0  # itens admitidos (esperando ou em leitura); limitado por MAX_QUEUE
+stats: Counter = Counter()  # contadores p/ /metrics
 captcha_free = asyncio.Event()
 captcha_free.set()
 coupons_cache = (0.0, {})  # (timestamp, {code: cupom})
 session_cache = (0.0, None)  # (timestamp, logged_in)
 session_lock = asyncio.Lock()  # uma checagem por vez: chamadas simultâneas esperam e reaproveitam o resultado
 captcha_state = {"needed": False, "reason": None, "blocked_url": None, "since": None, "session": None}  # reason: "captcha"|"login"; 1 sessão por vez
-store_cache: dict[str, tuple[float, dict]] = {}  # ponytail: sem limpeza ativa, só sobrescreve; adicionar varredura se houver muitas URLs distintas
+store_cache: dict[str, tuple[float, dict]] = {}  # varrido por sweep_caches() a cada ciclo do watchdog
 store_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # 1 consulta por URL, mesmo em lote
 
 
@@ -152,6 +161,7 @@ async def watchdog():
     fails = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
+        sweep_caches(time.time())
         urls = [p.url[:80] for p in browser_ctx.pages]
         if len(urls) > 4:  # normal: 1 janela do operador + até ~3 leituras/cupons em andamento
             logging.getLogger("uvicorn.error").warning("watchdog: %d abas abertas: %s", len(urls), urls)
@@ -170,6 +180,24 @@ async def watchdog():
 
 def fresh(ts: float, now: float, ttl: float) -> bool:
     return now - ts < ttl
+
+
+def norm_url(url: str) -> str:
+    """Chave de cache: tira fragmento e parâmetros de rastreio (matt_*, utm_*, source...), que não mudam o produto.
+    Variação/oferta (wid, variation...) fica. Outro host (ex. meli.la) só perde o fragmento."""
+    u = urlparse(url.strip())
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+         if not k.lower().startswith(TRACKING_PARAMS) and k.lower() not in TRACKING_NAMES]
+    return urlunparse(u._replace(query=urlencode(q), fragment=""))
+
+
+def sweep_caches(now: float):
+    """Remove entradas vencidas e locks ociosos (sem isso as URLs distintas se acumulam para sempre)."""
+    for cache, ttl in ((store_cache, STORE_TTL_S), (eligible_cache, ELIGIBLE_TTL_S), (ineligible_cache, INELIGIBLE_TTL_S)):
+        for k in [k for k, v in cache.items() if not fresh(v[0] if isinstance(v, tuple) else v, now, ttl)]:
+            cache.pop(k, None)
+    for k in [k for k, lock in store_locks.items() if not lock.locked()]:
+        store_locks.pop(k, None)  # sem await entre o lookup e o acquire: lock livre não tem espera
 
 
 def compare(final: float, informed: float) -> str:
@@ -445,6 +473,8 @@ async def coupon_eligible(item_id: str | None, price: float, loyalty: str, code:
         return None
     if key in eligible_cache and fresh(eligible_cache[key], time.time(), ELIGIBLE_TTL_S):
         return True
+    if key in ineligible_cache and fresh(ineligible_cache[key], time.time(), INELIGIBLE_TTL_S):
+        return False
     page = await light_page()
     try:
         await page.goto(f"https://www.mercadolivre.com.br/cupons/pdp?item_id={item_id}&unit_price={price}"
@@ -457,20 +487,48 @@ async def coupon_eligible(item_id: str | None, price: float, loyalty: str, code:
     if '"groupings"' not in html:  # lista não carregou: não dá para afirmar nada
         return None
     ok = f'"{code}"' in html
-    if ok:
-        eligible_cache[key] = time.time()
+    (eligible_cache if ok else ineligible_cache)[key] = time.time()
     return ok
 
 
 async def pace():
     """Garante MIN_GAP_S entre o início de duas leituras de produto."""
     global last_start
-    async with gap_lock:
-        await asyncio.sleep(max(0.0, last_start + MIN_GAP_S - time.time()))
-        last_start = time.time()
+    async with gap_lock:  # só reserva o horário; dorme fora do lock (leituras em outros slots não ficam presas atrás dele)
+        start = max(time.time(), last_start + MIN_GAP_S)
+        last_start = start
+    await asyncio.sleep(max(0.0, start - time.time()))
+
+
+async def bounded_from_start(make, timeout: float):
+    """O prazo só começa quando `make(started)` chama started.set() (já com slot e ritmo liberados): tempo de fila não conta.
+    Se o chamador desistir (cancelado), a leitura é cancelada junto e o slot volta."""
+    started = asyncio.Event()
+    task = asyncio.ensure_future(make(started))
+    waiter = asyncio.ensure_future(started.wait())
+    try:
+        await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            await asyncio.wait({task}, timeout=timeout)
+        if not task.done():
+            task.cancel()
+            raise asyncio.TimeoutError
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        waiter.cancel()
 
 
 async def fetch_store(url: str) -> dict:
+    try:
+        return await bounded_from_start(lambda started: read_store(url, started), REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {"status": "timeout"}
+
+
+async def read_store(url: str, started: asyncio.Event) -> dict:
     """Abre o produto e lê preço + item_id da página; ou {"status": erro}."""
     if (cs := captcha_state["session"]) and cs["status"] == "pending":  # alguém está resolvendo: não enfileira
         return {"status": "captcha", "detail": "verificação em andamento"}
@@ -478,6 +536,7 @@ async def fetch_store(url: str) -> dict:
     page = await read_page()
     try:
         await pace()
+        started.set()
         await page.goto(url, wait_until="domcontentloaded")
         if host_allowed(page.url) and is_social_page(page.url):  # vitrine do afiliado: segue o "Ir para produto"
             href = await page.eval_on_selector(SEL_SOCIAL_PRODUCT, "a => a.href") if await page.query_selector(SEL_SOCIAL_PRODUCT) else None
@@ -513,35 +572,37 @@ async def fetch_store(url: str) -> dict:
         await release_read_page(page)
 
 
-async def get_store(url: str) -> tuple[dict, bool]:
-    """(leitura da loja, veio_do_cache). Só leituras com sucesso são cacheadas."""
-    url = url.strip()
+async def get_store(url: str) -> tuple[dict, float | None]:
+    """(leitura da loja, idade em segundos se veio do cache, senão None). Só leituras com sucesso são cacheadas."""
+    url = norm_url(url)
     async with store_locks[url]:
         hit = store_cache.get(url)
         if hit and fresh(hit[0], time.time(), STORE_TTL_S):
-            return hit[1], True
+            return hit[1], time.time() - hit[0]
         store = await fetch_store(url)
         if store["status"] == "ok":
             store_cache[url] = (time.time(), store)
-        return store, False
+        return store, None
 
 
 async def check(item: Item) -> dict:
-    store, cached = await get_store(item.url)
+    store, age = await get_store(item.url)
     if store["status"] != "ok":
         return store
     price, with_coupon = store["price"], None
     out = {"status": "ok", "store_price": price, "price_matches": int(price) == int(item.price),
-           "coupon_applied": False, "price_with_coupon": None, "cached": cached}
+           "coupon_applied": False, "price_with_coupon": None, "cached": age is not None,
+           "cache_age_s": None if age is None else round(age)}
     if item.coupon:
         try:
-            c, msg = await get_coupon(item.coupon)
+            c, msg = await bounded(get_coupon(item.coupon), REQUEST_TIMEOUT_S)
         except Exception as e:  # lista de cupons não carregou: inconclusivo, não "inválido"
             c, msg = None, f"erro ao consultar cupons: {e}"
         if c is None:
             out.update(status=coupon_failure(msg), detail=msg)
         else:
-            out["coupon_eligible"] = await coupon_eligible(store["item_id"], price, store["loyalty"], c["code"].upper())
+            out["coupon_eligible"] = await bounded(
+                coupon_eligible(store["item_id"], price, store["loyalty"], c["code"].upper()), REQUEST_TIMEOUT_S)
             if out["coupon_eligible"] is False:
                 out["status"] = "coupon_not_applicable"
             else:
@@ -559,10 +620,31 @@ async def check(item: Item) -> dict:
 
 
 async def run(item: Item) -> dict:
+    """Prazo (REQUEST_TIMEOUT_S) vale por etapa de navegador, não inclui a espera na fila; a fila é limitada em admit()."""
+    t0 = time.time()
     try:
-        return await bounded(check(item), REQUEST_TIMEOUT_S)
+        out = await check(item)
     except asyncio.TimeoutError:
-        return {"status": "timeout"}
+        out = {"status": "timeout"}
+    stats[out["status"]] += 1
+    stats["cache_hit"] += bool(out.get("cached"))
+    logging.getLogger("uvicorn.error").info("item status=%s total=%.1fs cache=%s", out["status"], time.time() - t0,
+                                            out.get("cached", False))
+    return out
+
+
+@contextmanager
+def admit(n: int):
+    """Reserva n posições da fila; cheia = 503 com Retry-After (o chamador reenvia) em vez de esperar até estourar."""
+    global pending
+    if pending + n > MAX_QUEUE:
+        stats["rejected_busy"] += n
+        raise HTTPException(503, f"fila cheia ({pending}/{MAX_QUEUE})", headers={"Retry-After": str(min(300, int(MIN_GAP_S * max(1, pending) / SLOTS)))})
+    pending += n
+    try:
+        yield
+    finally:
+        pending -= n
 
 
 async def logged_in_quick() -> bool | None:
@@ -650,12 +732,31 @@ async def session(refresh: bool = False):
 
 @api.post("/check")
 async def check_one(item: Item):
-    return await run(item)
+    with admit(1):
+        return await run(item)
 
 
 @api.post("/check/batch")
 async def check_batch(items: list[Item]):
-    return await asyncio.gather(*(run(i) for i in items))
+    if len(items) > MAX_BATCH:
+        raise HTTPException(413, f"máximo de {MAX_BATCH} itens por lote")
+    with admit(len(items)):
+        return await asyncio.gather(*(run(i) for i in items))
+
+
+@api.get("/metrics")
+async def metrics():
+    return {"pending": pending, "max_queue": MAX_QUEUE, "slots": SLOTS, "store_cache": len(store_cache),
+            "store_locks": len(store_locks), **stats}
+
+
+@app.get("/health")  # sem token (healthcheck do Docker): abre/fecha uma aba de verdade
+async def health():
+    try:
+        await bounded(probe_browser(), 10)
+    except Exception as e:
+        raise HTTPException(503, f"navegador não responde: {type(e).__name__}")
+    return {"ok": True}
 
 
 # --- Resolver captcha pelo dashboard: sessão com link do noVNC (ponte VNC servida pela própria API) ---
@@ -685,6 +786,7 @@ def clear_account_caches():
     session_cache = (0.0, None)
     store_cache.clear()
     eligible_cache.clear()
+    ineligible_cache.clear()
 
 
 async def watch_session(s: dict):

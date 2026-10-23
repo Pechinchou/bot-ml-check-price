@@ -65,3 +65,39 @@ with tempfile.TemporaryDirectory() as d:
 assert is_social_page("https://www.mercadolivre.com.br/social/promotop?matt_word=x")
 assert not is_social_page("https://www.mercadolivre.com.br/panela/p/MLB68935558?source=affiliate-profile")
 print("ok")
+
+# --- fila, prazo e cache ---
+import asyncio
+import time as _t
+
+from app import bounded_from_start, norm_url, store_cache, store_locks, sweep_caches
+
+assert norm_url("https://x.mercadolivre.com.br/p/MLB1?matt_word=a&wid=MLB2&utm_source=z#frag") == "https://x.mercadolivre.com.br/p/MLB1?wid=MLB2"
+assert norm_url(" https://meli.la/abc ") == "https://meli.la/abc"
+store_cache["old"], store_cache["new"] = (_t.time() - 99999, {}), (_t.time(), {})
+store_locks["idle"]
+sweep_caches(_t.time())
+assert "old" not in store_cache and "new" in store_cache and "idle" not in store_locks
+store_cache.clear()
+
+
+async def _deadline():
+    async def slow_queue(started):  # 0,3s "na fila" + 0,1s de leitura: prazo 0,2s só conta a leitura
+        await asyncio.sleep(0.3)
+        started.set()
+        await asyncio.sleep(0.1)
+        return "ok"
+
+    async def slow_read(started):
+        started.set()
+        await asyncio.sleep(1)
+
+    assert await bounded_from_start(slow_queue, 0.2) == "ok"
+    try:
+        await bounded_from_start(slow_read, 0.2)
+        raise AssertionError("devia estourar")
+    except asyncio.TimeoutError:
+        pass
+
+
+asyncio.run(_deadline())

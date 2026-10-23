@@ -13,9 +13,9 @@ services:
     init: true       # reaper de processos: evita Camoufox órfão segurando o perfil
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/docs')"]
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
       interval: 30s
-      timeout: 5s
+      timeout: 15s
       start_period: 40s
 
   # Login/captcha pelo navegador: docker compose stop verify && docker compose --profile login up login
