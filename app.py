@@ -56,6 +56,9 @@ SESSION_CACHE_TTL_S = float(os.getenv("SESSION_CACHE_TTL_S", "30"))  # /session:
 SESSION_TIMEOUT_S = float(os.getenv("SESSION_TIMEOUT_S", "25"))
 WATCHDOG_INTERVAL_S = float(os.getenv("WATCHDOG_INTERVAL_S", "60"))
 WATCHDOG_TIMEOUT_S = float(os.getenv("WATCHDOG_TIMEOUT_S", "20"))
+RECYCLE_WAIT_S = 300  # quanto a reciclagem espera a fila esvaziar antes de tentar no próximo ciclo do watchdog
+RECYCLE_MEM_MB = int(os.getenv("RECYCLE_MEM_MB", "2500"))  # Firefox incha (1 processo de conteúdo p/ todas as abas) e o GC queima CPU: acima disso o navegador é recriado (a fila espera a troca)
+HARD_MEM_MB = int(os.getenv("HARD_MEM_MB", "5500"))  # perto do mem_limit (6g): reinicia o processo já, antes do OOM-kill do Docker
 MAX_PAGES = int(os.getenv("MAX_PAGES", "15"))  # abas abertas acima disso = vazamento (cada uma é um processo do Firefox)
 FINGERPRINT_FILE = Path("profile/fingerprint.json")
 # Cópia do MEMORY_PREFS de apps/verify-bot/src/scrape/browser.ts (repo promo-feed). Ficam gravadas no perfil: tirar uma daqui
@@ -92,6 +95,8 @@ main_page = None  # janela única mostrada ao operador no noVNC (cada new_page()
 read_pages: asyncio.Queue = asyncio.Queue()  # abas de leitura livres (None = ainda não criada); limita SLOTS leituras em paralelo
 for _ in range(SLOTS):  # ponytail: navegador único; escalar com mais perfis só se precisar
     read_pages.put_nowait(None)
+browser_cm = None  # context manager do AsyncCamoufox em uso (start_browser/stop_browser)
+browser_ready = asyncio.Event()  # limpo enquanto o navegador é recriado: watchdog, /health e a API esperam
 gap_lock, last_start = asyncio.Lock(), 0.0
 eligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; "elegível"
 ineligible_cache: dict[tuple, float] = {}  # (item_id, code) -> ts; "não elegível" (TTL curto)
@@ -156,11 +161,41 @@ async def probe_browser():
     await page.close()
 
 
+def container_mem_mb() -> float:
+    """Memória do container como o `docker stats` (cgroup v2 menos cache de arquivos); 0 se não der para ler."""
+    try:
+        cur = int(Path("/sys/fs/cgroup/memory.current").read_text())
+        stat = dict(l.split() for l in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines())
+        return (cur - int(stat.get("inactive_file", 0))) / 2**20
+    except Exception:
+        return 0.0
+
+
+def firefox_rss_mb() -> tuple[float, float]:
+    """(processo principal, maior processo de conteúdo) do Firefox em MB, lidos de /proc; só para diagnóstico."""
+    main = content = 0.0
+    for d in Path("/proc").glob("[0-9]*"):
+        try:
+            cmd = (d / "cmdline").read_bytes().decode(errors="ignore")
+            if "camoufox-bin" not in cmd:
+                continue
+            rss = int((d / "statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+        except Exception:
+            continue
+        if "-contentproc" not in cmd:
+            main = rss
+        elif cmd.rstrip("\0").endswith("tab"):
+            content = max(content, rss)
+    return main, content
+
+
 async def watchdog():
     """Navegador pendurado não dispara o evento `close`: se abrir/fechar uma aba falhar 2x seguidas, reinicia o processo."""
     fails = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
+        if not browser_ready.is_set():  # navegador sendo recriado
+            continue
         sweep_caches(time.time())
         urls = [p.url[:80] for p in browser_ctx.pages]
         if len(urls) > 4:  # normal: 1 janela do operador + até ~3 leituras/cupons em andamento
@@ -168,6 +203,15 @@ async def watchdog():
         if len(urls) > MAX_PAGES:
             logging.getLogger("uvicorn.error").error("watchdog: abas demais (vazamento): reiniciando")
             os._exit(1)
+        mem = container_mem_mb()
+        log = logging.getLogger("uvicorn.error")
+        log.info("watchdog: container=%.0f MB firefox(principal/conteúdo)=%.0f/%.0f MB pending=%d", mem, *firefox_rss_mb(), pending)
+        if mem > HARD_MEM_MB:
+            log.error("watchdog: %.0f MB (perto do limite do container): reiniciando o processo", mem)
+            os._exit(1)
+        if mem > RECYCLE_MEM_MB and not session_busy():  # login/captcha em andamento: o operador está na janela
+            await recycle()
+            continue
         try:
             await bounded(probe_browser(), WATCHDOG_TIMEOUT_S)
             fails = 0
@@ -308,38 +352,88 @@ def require_token(authorization: str = Header(None), x_api_token: str = Header(N
         raise HTTPException(401, "token inválido")
 
 
+async def start_browser():
+    """Abre o Firefox (headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela)."""
+    global browser_cm, browser_ctx, main_page
+    browser_cm = AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR",
+                               os="macos", firefox_user_prefs=FIREFOX_PREFS,
+                               fingerprint=stored_fingerprint(FINGERPRINT_FILE, pkg_version("camoufox"),
+                                                              lambda: generate_fingerprint(os="macos")))
+    ctx = await browser_cm.__aenter__()
+    browser_ctx = ctx
+    main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    closing = browser_cm.closing = {"on": False}
+
+    def on_browser_close(*_):
+        # navegador fechou/morreu (janela fechada no noVNC, falta de memória, crash): sem ele toda chamada dá 500.
+        # Encerra o processo para o Docker (restart: unless-stopped) subir tudo de novo.
+        if not closing["on"]:
+            logging.getLogger("uvicorn.error").error("navegador fechou: encerrando o processo para reiniciar")
+            os._exit(1)
+
+    ctx.on("close", on_browser_close)
+    browser_ready.set()
+
+
+async def stop_browser():
+    browser_cm.closing["on"] = True  # desligamento normal não é falha
+    await browser_cm.__aexit__(None, None, None)
+
+
+def session_busy() -> bool:
+    s = captcha_state["session"]
+    return captcha_state["needed"] or bool(s and s["status"] == "pending")
+
+
+async def recycle():
+    """Recria o Firefox quando a memória incha, sem recusar ninguém: segura todas as vagas de leitura e a de cupom
+    (as requisições seguintes esperam na fila, em ordem) e só troca o navegador com tudo ocioso."""
+    log = logging.getLogger("uvicorn.error")
+    held = []
+    try:
+        for _ in range(SLOTS):
+            held.append(await asyncio.wait_for(read_pages.get(), RECYCLE_WAIT_S))
+        await asyncio.wait_for(coupon_pages.acquire(), RECYCLE_WAIT_S)
+    except asyncio.TimeoutError:  # fila não esvaziou a tempo: devolve e tenta no próximo ciclo
+        for page in held:
+            read_pages.put_nowait(page)
+        return
+    log.warning("reciclando o navegador (%.0f MB, pending=%d)", container_mem_mb(), pending)
+    browser_ready.clear()
+    try:
+        await bounded(stop_browser(), 60)
+        await bounded(start_browser(), 120)
+    except BaseException:
+        log.exception("falha ao reciclar o navegador: reiniciando o processo")
+        os._exit(1)
+    for _ in held:  # abas antigas morreram com o navegador; a próxima leitura cria outra
+        read_pages.put_nowait(None)
+    coupon_pages.release()
+    log.warning("navegador reciclado: %.0f MB", container_mem_mb())
+
+
 @asynccontextmanager
 async def lifespan(_):
-    global browser_ctx, main_page
     if not API_TOKEN:
         logging.getLogger("uvicorn.error").warning("API_TOKEN não definido: API sem autenticação")
-    # headed + perfil persistente: permite login manual (2FA) e resolver captcha na janela
-    async with AsyncCamoufox(headless=HEADLESS, persistent_context=True, user_data_dir="profile", locale="pt-BR",
-                             os="macos", firefox_user_prefs=FIREFOX_PREFS,
-                             fingerprint=stored_fingerprint(FINGERPRINT_FILE, pkg_version("camoufox"),
-                                                            lambda: generate_fingerprint(os="macos"))) as ctx:
-        browser_ctx = ctx
-        main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        closing = {"on": False}
-
-        def on_browser_close(*_):
-            # navegador fechou/morreu (janela fechada no noVNC, falta de memória, crash): sem ele toda chamada dá 500.
-            # Encerra o processo para o Docker (restart: unless-stopped) subir tudo de novo.
-            if not closing["on"]:
-                logging.getLogger("uvicorn.error").error("navegador fechou: encerrando o processo para reiniciar")
-                os._exit(1)
-
-        ctx.on("close", on_browser_close)
-        wd = asyncio.create_task(watchdog())
-        try:
-            yield
-        finally:
-            wd.cancel()
-            closing["on"] = True  # desligamento normal não é falha
+    await start_browser()
+    wd = asyncio.create_task(watchdog())
+    try:
+        yield
+    finally:
+        wd.cancel()
+        await stop_browser()
 
 
 app = FastAPI(lifespan=lifespan)  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
-api = APIRouter(dependencies=[Depends(require_token)])
+async def wait_browser():
+    await browser_ready.wait()  # navegador sendo recriado: a requisição espera, não falha
+
+
+api = APIRouter(dependencies=[Depends(require_token), Depends(wait_browser)])
+
+
+coupon_pages = asyncio.Semaphore(1)  # abas de cupom fora dos SLOTS: sem limite, vários /check abriam dezenas ao mesmo tempo
 
 
 async def light_page():
@@ -425,33 +519,35 @@ async def load_coupons(force: bool = False) -> dict:
     ts, cache = coupons_cache
     if not force and time.time() - ts < COUPONS_TTL_S:
         return cache
-    page = await light_page()
-    try:
-        await page.goto(COUPONS_URL, wait_until="domcontentloaded")
-        await page.wait_for_selector("text=Meus cupons", timeout=15000)
-        found = parse_coupons(await page.content())
-    finally:
-        await page.close()
+    async with coupon_pages:
+        page = await light_page()
+        try:
+            await page.goto(COUPONS_URL, wait_until="domcontentloaded")
+            await page.wait_for_selector("text=Meus cupons", timeout=15000)
+            found = parse_coupons(await page.content())
+        finally:
+            await page.close()
     coupons_cache = (time.time(), found)
     return found
 
 
 async def add_coupon(code: str) -> str:
     """Insere o código na conta (modal 'Inserir código' em /cupons); devolve o texto do modal."""
-    page = await browser_ctx.new_page()
-    try:
-        await page.goto(ADD_COUPON_URL, wait_until="domcontentloaded")
-        await page.click(SEL_ADD_COUPON_LINK)
-        await page.fill(SEL_ADD_COUPON_INPUT, code)
-        await page.get_by_role("button", name="Inserir", exact=True).click()
-        await page.wait_for_timeout(2500)
-        # sobe do input até o menor ancestral com texto curto: o corpo do modal com a mensagem do site
-        return await page.eval_on_selector(SEL_ADD_COUPON_INPUT, """el => {
-            while (el.parentElement && el.innerText.length < 40) el = el.parentElement;
-            return el.innerText.replace(/\\s+/g, ' ').trim();
-        }""")
-    finally:
-        await page.close()
+    async with coupon_pages:
+        page = await browser_ctx.new_page()
+        try:
+            await page.goto(ADD_COUPON_URL, wait_until="domcontentloaded")
+            await page.click(SEL_ADD_COUPON_LINK)
+            await page.fill(SEL_ADD_COUPON_INPUT, code)
+            await page.get_by_role("button", name="Inserir", exact=True).click()
+            await page.wait_for_timeout(2500)
+            # sobe do input até o menor ancestral com texto curto: o corpo do modal com a mensagem do site
+            return await page.eval_on_selector(SEL_ADD_COUPON_INPUT, """el => {
+                while (el.parentElement && el.innerText.length < 40) el = el.parentElement;
+                return el.innerText.replace(/\\s+/g, ' ').trim();
+            }""")
+        finally:
+            await page.close()
 
 
 coupon_lock = asyncio.Lock()  # evita inserir o mesmo código várias vezes em lote
@@ -475,15 +571,16 @@ async def coupon_eligible(item_id: str | None, price: float, loyalty: str, code:
         return True
     if key in ineligible_cache and fresh(ineligible_cache[key], time.time(), INELIGIBLE_TTL_S):
         return False
-    page = await light_page()
-    try:
-        await page.goto(f"https://www.mercadolivre.com.br/cupons/pdp?item_id={item_id}&unit_price={price}"
-                        f"&quantity=1&loyalty={loyalty}&new_version=true", wait_until="domcontentloaded")
-        html = await page.content()
-    except Exception:
-        return None
-    finally:
-        await page.close()
+    async with coupon_pages:
+        page = await light_page()
+        try:
+            await page.goto(f"https://www.mercadolivre.com.br/cupons/pdp?item_id={item_id}&unit_price={price}"
+                            f"&quantity=1&loyalty={loyalty}&new_version=true", wait_until="domcontentloaded")
+            html = await page.content()
+        except Exception:
+            return None
+        finally:
+            await page.close()
     if '"groupings"' not in html:  # lista não carregou: não dá para afirmar nada
         return None
     ok = f'"{code}"' in html
@@ -550,8 +647,8 @@ async def read_store(url: str, started: asyncio.Event) -> dict:
             return {"status": "login_required", "detail": f"url: {page.url}"}
         if reason := await has_captcha(page):
             logging.getLogger("uvicorn.error").warning("captcha: %s (%s)", url, reason)
-            if SOLVE_REMOTE:  # o dashboard mostra o alerta (/captcha/status) e abre uma sessão (/captcha/session)
-                flag_blocked("captcha", url)
+            flag_blocked("captcha", url)  # /captcha/status mostra o alerta em qualquer modo; some na próxima leitura ok
+            if SOLVE_REMOTE:  # o dashboard abre uma sessão (/captcha/session)
                 return {"status": "captcha", "detail": reason}
             if HEADLESS or not await wait_captcha(page):  # headless: ninguém para resolver, não espera
                 return {"status": "captcha", "detail": reason}
@@ -752,6 +849,8 @@ async def metrics():
 
 @app.get("/health")  # sem token (healthcheck do Docker): abre/fecha uma aba de verdade
 async def health():
+    if not browser_ready.is_set():  # reciclando: o healthcheck do Docker não pode matar o container
+        return {"ok": True, "recycling": True}
     try:
         await bounded(probe_browser(), 10)
     except Exception as e:
