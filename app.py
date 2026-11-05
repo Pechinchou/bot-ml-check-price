@@ -29,6 +29,9 @@ HEADLESS = "virtual" if _h == "virtual" else _h in ("1", "true", "yes")  # virtu
 # display = navegador visível numa tela virtual fixa (DISPLAY, ex. :99) espelhada por VNC: captcha resolvido remotamente (/captcha/*)
 SOLVE_REMOTE = _h == "display"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+# Prefixo no id/token da sessão p/ o nginx rotear /vnc e /captcha/session ao servidor dono (vários servidores atrás de um LB)
+INSTANCE_ID = os.getenv("INSTANCE_ID", "")
+_PFX = f"{INSTANCE_ID}." if INSTANCE_ID else ""
 CAPTCHA_SESSION_TTL_S = float(os.getenv("CAPTCHA_SESSION_TTL_S", "900"))
 NOVNC_ROOT = Path(os.getenv("NOVNC_ROOT", "/usr/share/novnc"))
 VNC_ADDR = ("127.0.0.1", 5900)  # x11vnc só em localhost; quem expõe é a ponte /vnc/{token}/websockify
@@ -960,7 +963,7 @@ async def open_session(kind: str, url: str, force: bool = False) -> dict:
         await page.bring_to_front()
     except Exception as e:
         raise HTTPException(502, f"não abriu a página: {e}")
-    s = {"id": secrets.token_hex(8), "kind": kind, "token": secrets.token_urlsafe(32), "status": "pending",
+    s = {"id": _PFX + secrets.token_hex(8), "kind": kind, "token": _PFX + secrets.token_urlsafe(32), "status": "pending",
          "detail": "", "expires_at": time.time() + CAPTCHA_SESSION_TTL_S, "page": page, "force": force}
     captcha_state["session"] = s
     s["task"] = asyncio.create_task((watch_login if kind == "login" else watch_session)(s))  # referência forte: senão o GC pode matar a tarefa
