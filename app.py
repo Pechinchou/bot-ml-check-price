@@ -272,6 +272,8 @@ def is_login_url(url: str) -> bool:
 
 def flag_blocked(reason: str, url: str):
     """O dashboard vê isso em /captcha/status: reason=captcha (resolver a verificação) ou login (entrar na conta)."""
+    if not captcha_state["needed"]:
+        logging.getLogger("uvicorn.error").warning("bloqueio: reason=%s url=%s", reason, url)
     captcha_state.update(needed=True, reason=reason, blocked_url=url, since=captcha_state["since"] or time.time())
 
 
@@ -475,8 +477,10 @@ async def has_captcha(page) -> str:
     """O que indicou bloqueio/captcha (vazio = nada); o motivo vai no `detail` da resposta."""
     if "captcha" in page.url or any(p in page.url for p in BLOCK_PATHS):
         return f"url: {page.url}"
-    el = await page.query_selector(SEL_CAPTCHA)
-    return f"elemento: {(await el.evaluate('e => e.outerHTML'))[:160]}" if el else ""
+    for el in await page.query_selector_all(SEL_CAPTCHA):
+        if await el.is_visible():  # elemento escondido (badge/script com "captcha" na classe) não é bloqueio: prendia o estado
+            return f"elemento: {(await el.evaluate('e => e.outerHTML'))[:160]}"
+    return ""
 
 
 async def wait_captcha(page) -> bool:
@@ -903,6 +907,8 @@ async def watch_session(s: dict):
                 await asyncio.sleep(5)  # deixa os cookies serem gravados no perfil
                 clear_blocked()
                 return await end_session(s, "solved")
+        if not await has_captcha(page):  # expirou sem captcha visível: não deixa o alerta preso (bloqueava as leituras)
+            clear_blocked()
         await end_session(s, "expired")
     except Exception as e:
         await end_session(s, "expired", str(e))
