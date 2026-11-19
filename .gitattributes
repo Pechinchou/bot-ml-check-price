@@ -1,0 +1,7 @@
+# Estes arquivos são executados dentro do container Linux. Com core.autocrlf=true (padrão no
+# Git for Windows) o checkout os converteria para CRLF e o shebang viraria "#!/bin/sh\r":
+# o kernel procura um interpretador chamado "/bin/sh\r" e o container morre com
+# "exec ./start.sh failed: No such file or directory" (exit 127).
+*.sh          text eol=lf
+Dockerfile    text eol=lf
+.env.example  text eol=lf

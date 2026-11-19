@@ -19,10 +19,11 @@ persistente** (`profile/`) com a sessão logada, e o captcha pode ser resolvido 
 6. [Endpoints](#endpoints)
 7. [Regras de negócio](#regras-de-negócio)
 8. [Produção: checklist](#produção-checklist)
-9. [Rodar sem Docker (desenvolvimento)](#rodar-sem-docker-desenvolvimento)
-10. [Solução de problemas](#solução-de-problemas)
-11. [Testes e estrutura](#testes-e-estrutura)
-12. [Limitações e próximos passos](#limitações-e-próximos-passos)
+9. [CI/CD (GitHub Actions)](#cicd-github-actions)
+10. [Rodar sem Docker (desenvolvimento)](#rodar-sem-docker-desenvolvimento)
+11. [Solução de problemas](#solução-de-problemas)
+12. [Testes e estrutura](#testes-e-estrutura)
+13. [Limitações e próximos passos](#limitações-e-próximos-passos)
 
 ---
 
@@ -216,6 +217,11 @@ Só há **uma sessão do operador por vez** (captcha ou login). Se já existe um
 Todas as rotas abaixo exigem o token (`X-Api-Token` ou `Authorization: Bearer`). A documentação interativa fica em
 `/docs` (sem token).
 
+**Testar pelo `/docs`:** clique em **Authorize** (canto superior direito), cole o `API_TOKEN` do servidor e
+confirme. O Swagger passa a enviar o header `X-Api-Token` em **todas** as rotas, então o "Try it out" de
+qualquer endpoint já funciona — sem montar `curl` na mão. O token fica só na aba do navegador; recarregar a
+página pede o Authorize de novo.
+
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/session` | `{"logged_in": true/false, "cached": bool}`: o perfil está logado? A resposta é reaproveitada por `SESSION_CACHE_TTL_S` (30 s); use `?refresh=true` para forçar. Chamadas simultâneas dividem uma só checagem; se passar de `SESSION_TIMEOUT_S` (25 s) devolve o último valor com `stale: true` (ou 504 se nunca checou). Se estiver deslogado, também marca `needed: true` com `reason: "login"` em `/captcha/status`. |
@@ -322,6 +328,212 @@ Resposta de exemplo:
 
 ---
 
+## CI/CD (GitHub Actions)
+
+Duas instâncias desta API rodam atrás de um load balancer. O deploy é **sequencial**: o servidor 1 é
+atualizado e só quando volta a `healthy` o servidor 2 é tocado — enquanto um reinicia, o LB mantém o tráfego
+no outro. Se o servidor 1 falhar, o servidor 2 **não** é atualizado (continua com a versão boa no ar).
+
+```
+push na main ──> CI (testes) ──> servidor 1 (build, up -d --wait) ──> servidor 2 (idem)
+                                          └─ não ficou healthy? o 2 nem começa
+```
+
+Tudo num arquivo só, `.github/workflows/ci-cd.yml`, com três jobs:
+
+| Job | O que faz |
+|---|---|
+| `test` | `test_parse.py`, sintaxe do Python e dos shells, `docker compose config`. Em PR é o único que roda. |
+| `plan` | Decide quais instâncias atualizar (`both`, `server1` ou `server2`). |
+| `deploy` | Uma instância por vez: SSH, `git reset --hard <sha>` e `docker compose up -d --build --wait`. |
+
+>  **Antes do primeiro push na `main`** com este arquivo, configure os segredos abaixo: o workflow dispara
+>  sozinho nesse push e, sem os segredos, o job `deploy` falha no SSH (nada é alterado nos servidores).
+
+Não há script de deploy: o job roda um comando SSH só, com três partes encadeadas por `&&`.
+
+### Topologia
+
+São **três** máquinas, e só duas rodam a aplicação:
+
+| Máquina | Nome no pipeline | Acesso |
+|---|---|---|
+| VPS na nuvem | `server1` — instância 1 | SSH direto |
+| Máquina de IP público na empresa | `bastion` — **não roda a aplicação** | SSH direto |
+| Máquina na rede privada da empresa | `server2` — instância 2 | só pela LAN do gateway |
+
+A instância 2 é alcançada com `ProxyJump bastion`: o runner conecta no gateway e, por dentro dessa conexão,
+abre o SSH até a máquina da rede privada — o mesmo que você faz à mão (`ssh gateway`, depois `ssh maquina`),
+em um comando. A máquina privada não precisa aceitar conexão de fora nem abrir porta no firewall; para ela, a
+conexão chega da LAN. Exige só `AllowTcpForwarding yes` no gateway (padrão do OpenSSH).
+
+### Segredos do repositório
+
+Em *Settings → Secrets and variables → Actions* — **10 secrets**. O SSH usa a porta 22 nas três máquinas; se
+algum dia uma delas mudar de porta, acrescente `Port <n>` na entrada dela no `~/.ssh/config` do workflow.
+
+| Secret | Valor |
+|---|---|
+| `SSH_PRIVATE_KEY` | Chave privada de deploy, **autorizada nas três** máquinas (a mesma chave faz o salto e o destino). |
+| `SSH_KNOWN_HOSTS` | Host keys das três máquinas (ver abaixo). |
+| `BASTION_HOST` / `BASTION_USER` | Gateway: IP público da empresa e usuário SSH. Não precisa de Docker nem do repo. |
+| `SERVER1_HOST` / `SERVER2_HOST` | IP público da VPS; IP de LAN da máquina privada. |
+| `SERVER1_USER` / `SERVER2_USER` | Usuário SSH de cada instância (precisa estar no grupo `docker`). |
+| `SERVER1_DIR` / `SERVER2_DIR` | Caminho do clone em cada instância, ex.: `/opt/bot-ml-check-price`. |
+
+#### `SSH_PRIVATE_KEY`
+
+Gere uma chave **dedicada ao deploy** (não reaproveite a sua pessoal) e **sem passphrase** — o runner não tem
+como digitar uma:
+
+```bash
+ssh-keygen -t ed25519 -C "deploy-github-actions" -f ~/.ssh/ml-check-deploy -N ""
+```
+
+No **PowerShell** o `""` vazio é descartado antes de chegar ao `ssh-keygen` (erro
+`option requires an argument -- N`); use aspas simples em volta, ou omita o `-N` e aperte Enter duas vezes:
+
+```powershell
+ssh-keygen -t ed25519 -C "deploy-github-actions" -f $HOME\.ssh\ml-check-deploy -N '""'
+```
+
+Isso cria dois arquivos. A **pública** (`.pub`) vai para as três máquinas; a **privada** é o conteúdo do
+secret:
+
+```bash
+VPS=<user>@<ip-da-vps>
+GW=<user>@<ip-publico-da-empresa>
+LAN=<user>@<ip-lan-da-maquina-2>
+K=~/.ssh/ml-check-deploy
+
+# autoriza nas três (a privada nunca sai do seu computador/runner).
+# ssh-copy-id é idempotente: rodar de novo não duplica a linha no authorized_keys
+ssh-copy-id -i $K.pub "$VPS"   && ssh-copy-id -i $K.pub "$GW"   && ssh-copy-id -i $K.pub -o ProxyJump="$GW" "$LAN"   && echo "OK: autorizada nas 3"
+
+# copia a chave privada para colar no secret
+pbcopy < $K                                 # Mac
+# Get-Content ~/.ssh/ml-check-deploy -Raw | Set-Clipboard    # Windows (PowerShell)
+```
+
+No Windows, use o **Git Bash** para estes comandos: ele traz `ssh-copy-id` e `ssh-keyscan`, que não existem no
+PowerShell.
+
+No secret vai o arquivo **inteiro**, incluindo as linhas `-----BEGIN OPENSSH PRIVATE KEY-----` e
+`-----END OPENSSH PRIVATE KEY-----`.
+
+#### `SSH_KNOWN_HOSTS`
+
+É a identidade das máquinas (evita MITM; por isso o workflow não usa `StrictHostKeyChecking=no`). O runner não
+alcança a rede privada para escanear, então a terceira linha sai de dentro do gateway:
+
+```bash
+ssh-keyscan <ip-da-vps>               # do seu computador
+ssh-keyscan <ip-publico-da-empresa>   # do seu computador
+ssh-keyscan <ip-lan-da-maquina-2>     # logado no gateway
+```
+
+Dá para fazer os três de uma vez sem entrar no gateway, rodando o terceiro `ssh-keyscan` remotamente por lá:
+
+```bash
+{ ssh-keyscan <ip-da-vps>
+  ssh-keyscan <ip-publico-da-empresa>
+  ssh <user>@<ip-publico-da-empresa> "ssh-keyscan <ip-lan-da-maquina-2>"
+} > known_hosts.txt
+```
+
+O conteúdo de `known_hosts.txt` é o secret (o `ssh-keyscan` manda as chaves no stdout e o progresso no stderr,
+então o redirecionamento já separa). Cada máquina costuma devolver 2–3 linhas, uma por tipo de chave — cole
+**todas**.
+
+> **Importante:** escaneie exatamente o mesmo valor que você vai pôr em `BASTION_HOST`, `SERVER1_HOST` e
+> `SERVER2_HOST`. O `known_hosts` casa por *nome*: se o secret tem o IP e você escaneou o hostname (ou
+> vice-versa), a verificação falha com `Host key verification failed`.
+
+#### Validar antes de confiar no pipeline
+
+Do seu Mac, que está na mesma situação do runner:
+
+```bash
+K=~/.ssh/ml-check-deploy
+ssh -i $K -o IdentitiesOnly=yes <user>@<ip-da-vps> 'uname -n'
+
+# a chave precisa ser informada TAMBÉM para o salto: opções de linha de comando (-i, -J)
+# valem para o destino, não para o host do ProxyJump
+ssh -i $K -o IdentitiesOnly=yes   -o ProxyCommand="ssh -i $K -o IdentitiesOnly=yes -W %h:%p <user>@<ip-publico-da-empresa>"   <user>@<ip-lan-da-maquina-2> 'uname -n'
+```
+
+Se os dois imprimirem o nome da máquina sem pedir senha, o deploy funciona. (No workflow isso não é um
+problema: ele define `IdentityFile` na entrada `bastion` do `~/.ssh/config`, que o `ProxyJump` respeita.)
+
+Pré-requisitos (uma vez, fora do pipeline):
+
+- **Ajustes por máquina** (limites diferentes de CPU/memória, portas etc.) vão num
+  `docker-compose.override.yml` ao lado do compose — ele é mesclado automaticamente pelo `docker compose` e
+  está no `.gitignore`, então sobrevive ao `git reset --hard` do deploy. **Não** edite o
+  `docker-compose.yml` versionado no servidor: a alteração seria perdida no próximo deploy. Exemplo:
+
+  ```yaml
+  # docker-compose.override.yml — só nesta máquina
+  services:
+    verify:
+      mem_limit: 12g
+      cpus: "8"
+  ```
+- **Nas duas instâncias**: repo clonado em `SERVER{N}_DIR`, com `.env` preenchido e `profile/` logado (ambos
+  são **locais** da máquina e nunca são sobrescritos pelo deploy — estão no `.gitignore`); `git fetch`
+  funcionando sem senha interativa (deploy key ou token no credential helper); e o `origin` apontando para o
+  repo da organização — confira com `git remote -v` e, se estiver num fork, corrija:
+
+  ```bash
+  git remote set-url origin https://github.com/Pechinchou/bot-ml-check-price.git
+  git fetch origin   # tem que funcionar sem pedir senha
+  ```
+
+  A chave de deploy do pipeline **não** serve para isso: ela é do runner para as máquinas; esta é da máquina
+  para o GitHub.
+- **Nas três máquinas**: chave pública do deploy no `authorized_keys`. A chave privada fica **só no runner** —
+  não copie para o gateway, e não é preciso agent forwarding: a autenticação na instância 2 é de ponta a
+  ponta, por dentro do túnel.
+- **No gateway**: `AllowTcpForwarding yes` no sshd (padrão do OpenSSH). Nada mais — sem Docker, sem o repo.
+
+### O que o deploy faz em cada servidor
+
+```bash
+cd <SERVER{N}_DIR>   && git fetch --prune origin   && git reset --hard <sha>   && docker compose up -d --build --wait --wait-timeout 300 verify
+```
+
+- **`reset --hard` em vez de `pull`**: implanta o commit exato que passou no CI, sem travar por causa de
+  alteração local no servidor. Não toca em `.env` nem em `profile/` (ignorados pelo Git).
+- **`--wait`**: o compose só retorna quando o healthcheck do serviço passa, e sai com erro se não passar.
+  É o que mantém o deploy sequencial seguro — se o servidor 1 não voltar, o job falha e o `fail-fast` da
+  matriz impede que o servidor 2 seja tocado.
+- **`--build`**: a imagem é construída no próprio servidor. Mudança só em `app.py` reaproveita o cache das
+  camadas do Camoufox e leva segundos.
+
+Se algo falhar, um step de diagnóstico imprime `git log -1`, `docker compose ps` e as últimas linhas do log
+daquele servidor no próprio Actions.
+
+### Deploy manual e rollback
+
+Na aba **Actions → CI/CD → Run workflow**:
+
+- `target`: `both` (padrão), `server1` ou `server2` — útil para redeploy de uma instância só.
+- `sha`: vazio usa o `HEAD`; informe o **SHA anterior** para fazer rollback das duas instâncias.
+
+Mudanças só em arquivos `.md` não disparam deploy. Dois deploys nunca rodam ao mesmo tempo
+(`concurrency: deploy`).
+
+### Observações
+
+- O deploy reinicia o container: um `POST /check` em andamento é abortado (até `REQUEST_TIMEOUT_S`). Prefira
+  horários de baixo movimento se isso importar.
+- Antes de usar o serviço `login` num servidor, lembre que um deploy concorrente vai falhar de propósito no
+  pré-flight — é intencional, para não disputar o `profile/`.
+- O build roda em cada servidor. Mudança em `requirements.txt` refaz o download de ~1,3 GB do Camoufox nos
+  dois; mudança só em `app.py` reaproveita o cache e leva segundos. Se isso incomodar, o caminho é publicar a
+  imagem no `ghcr.io` pelo CI e trocar o `build` por `pull` no script de deploy do `ci-cd.yml`.
+
+---
 ## Rodar sem Docker (desenvolvimento)
 
 Requer Python 3.12+ (testado em 3.14) e `pip`.
@@ -351,6 +563,7 @@ cp .env.example .env                         # HEADLESS=0 abre a janela do naveg
 | `/check` → `captcha` | Use o [fluxo de captcha](#captcha-pelo-dashboard). O campo `detail` mostra se foi URL de bloqueio ou elemento da página. Se for frequente, aumente `MIN_GAP_S`. |
 | 500 com `TargetClosedError ... browser has been closed` | O navegador do servidor fechou. A API reinicia o processo sozinha (≈15 s). Se não reiniciar, `docker compose restart verify`. |
 | Link do noVNC → 404 | A sessão não está mais `pending` (resolvida, expirada, ou o container reiniciou). Gere outra. |
+| Deploy: `Permission denied (publickey)` numa máquina, apesar do `ssh-copy-id` ter dito `key(s) added: 1` | Home gravável por grupo/outros: com `StrictModes yes` (padrão) o sshd ignora o `authorized_keys`. Confira com `ls -ld ~` e corrija com `chmod go-w ~`. O motivo exato aparece em `sudo tail -40 /var/log/auth.log`. |
 | noVNC: "Falha ao conectar-se ao servidor" | Proxy sem suporte a WebSocket, ou sessão encerrada. Veja os headers do exemplo nginx e `docker compose logs verify`. |
 | `Server is already active for display 99` | Trava velha do Xvfb. Já tratado em `start.sh`/`login.sh`; reconstrua a imagem. |
 | `Failed to launch the browser process` | Outro container/processo usa o mesmo `profile/`. Pare o outro (`docker compose ps`, `pkill ...`). |
@@ -378,6 +591,7 @@ Dockerfile          Imagem (Python + Camoufox + Xvfb + x11vnc + noVNC)
 docker-compose.yml  Serviços: verify (API) e login (perfil "login", sob demanda)
 requirements.txt    Dependências Python (websockets é instalado numa camada própria do Dockerfile)
 test_parse.py       Testes unitários
+.github/workflows/  ci-cd.yml: testes e deploy sequencial nas 2 instâncias
 .env.example        Modelo de configuração
 profile/            Sessão do navegador (NÃO versionar; contém a sessão da sua conta)
 ```

@@ -12,7 +12,8 @@ from importlib.metadata import version as pkg_version
 
 from camoufox.async_api import AsyncCamoufox
 from camoufox.fingerprints import generate_fingerprint
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Security, WebSocket
+from fastapi.security import APIKeyHeader
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 from pathlib import Path
@@ -349,7 +350,17 @@ class Item(BaseModel):
         return v.strip()
 
 
-def require_token(authorization: str = Header(None), x_api_token: str = Header(None)):
+# Declarado como security scheme (e não como Header solto) para o /docs ganhar o botão "Authorize":
+# o token é digitado uma vez e o Swagger passa a mandá-lo em todas as chamadas, inclusive no "Try it out".
+# auto_error=False: quem autentica por Authorization: Bearer continua valendo, e sem API_TOKEN a API segue aberta.
+token_header = APIKeyHeader(
+    name="X-Api-Token", auto_error=False, scheme_name="Token da API",
+    description="Cole o valor de `API_TOKEN` do servidor. Também aceito como `Authorization: Bearer <token>`.")
+
+
+def require_token(x_api_token: str = Security(token_header),
+                  # compat com quem já manda Authorization: Bearer; fora do schema p/ não duplicar o campo no /docs
+                  authorization: str = Header(None, include_in_schema=False)):
     if not API_TOKEN:
         return  # sem token configurado: aberto (dev local)
     given = x_api_token or (authorization or "").removeprefix("Bearer ").strip()
@@ -430,7 +441,13 @@ async def lifespan(_):
         await stop_browser()
 
 
-app = FastAPI(lifespan=lifespan)  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
+app = FastAPI(  # /docs e /vnc/* sem token da API (o /vnc usa o token da sessão)
+    lifespan=lifespan,
+    title="Verificador de preços e cupons do Mercado Livre",
+    description="Clique em **Authorize**, cole o `API_TOKEN` do servidor e todas as rotas abaixo ficam "
+                "liberadas para testar aqui mesmo.")
+
+
 async def wait_browser():
     await browser_ready.wait()  # navegador sendo recriado: a requisição espera, não falha
 
