@@ -1,4 +1,5 @@
 profile/
-.venv/
+*venv/
 __pycache__/
 .env
+docker-compose.override.yml
