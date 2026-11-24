@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, is_social_page, login_step, parse_price, parse_product_read, stored_fingerprint, safe_static_path, session_valid
+from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, parse_wallet_page, is_social_page, login_step, parse_price, parse_product_read, stored_fingerprint, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -101,3 +101,34 @@ async def _deadline():
 
 
 asyncio.run(_deadline())
+
+import json as _json
+def _page(props: dict) -> str:
+    ctx = {"appProps": {"pageProps": props}}
+    return f'<script id="__NORDIC_RENDERING_CTX__">_n.ctx.r={_json.dumps(ctx)};</script>'
+RAW = [{"campaign_id": "1", "code": "SEMPREOFF", "status": {"id": "ACTIVE"}, "activation_type": "INPUT_CODE",
+        "title": {"text": "18% OFF com SEMPREOFF"}, "expiration_date": {"text": "Vence 20 de novembro"},  # selo, não a data
+        "future_coupon_info": {"expiration_date": "2026-11-20T02:59Z"}},
+       {"campaign_id": "2", "code": "", "status": {"id": "ACTIVE"}, "activation_type": "EU_QUERO"}]
+W = parse_wallet_page(_page({"activeCouponsData": {"pagination": {"page": 2, "total": 3}, "rawCoupons": RAW,
+                                                   "totalCouponsQuantity": {"number": 85}}}))
+assert W["page"] == 2 and W["total_pages"] == 3 and W["total_coupons"] == 85
+assert W["coupons"] == [{"code": "SEMPREOFF", "campaign_id": "1", "status": "ACTIVE", "expiration_date": "2026-11-20T02:59Z",
+                         "activation_type": "INPUT_CODE", "title": "18% OFF com SEMPREOFF"}]  # "Eu quero" sem código fica fora
+# /cupons/filter traz "Todos" e "Meus cupons": vale a carteira
+both = parse_wallet_page(_page({"filteredCouponsData": {"pagination": {"page": 1, "total": 110}, "rawCoupons": []},
+                                "activeCouponsData": {"pagination": {"page": 1, "total": 3}, "rawCoupons": RAW}}))
+assert both["total_pages"] == 3 and len(both["coupons"]) == 1
+camel = parse_wallet_page(_page({"activeCouponsData": {"pagination": {"page": 1, "total": 1}, "coupons": [
+    {"campaignId": "9", "code": "PECHINCHA", "status": {"id": "ACTIVE"}, "expirationDate": {"text": "Vence 1 de janeiro"},
+     "futureCouponInfo": {"expiration_date": "2027-01-01T02:59Z"}}]}}))
+assert camel["coupons"][0]["campaign_id"] == "9" and camel["coupons"][0]["expiration_date"] == "2027-01-01T02:59Z"
+for broken in ("<html>sem dados</html>", _page({"outra": {}}), "_n.ctx.r={quebrado",
+               _page({"activeCouponsData": {"rawCoupons": RAW}}),  # sem pagination
+               _page({"activeCouponsData": {"pagination": None, "rawCoupons": RAW}}),
+               _page({"activeCouponsData": {"pagination": {"page": 1, "total": 3}}})):  # sem array de cupons
+    try:
+        parse_wallet_page(broken)
+        raise AssertionError("página ilegível não pode virar carteira vazia")
+    except ValueError:
+        pass

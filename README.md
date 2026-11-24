@@ -221,6 +221,7 @@ Todas as rotas abaixo exigem o token (`X-Api-Token` ou `Authorization: Bearer`).
 | `GET` | `/session` | `{"logged_in": true/false, "cached": bool}`: o perfil está logado? A resposta é reaproveitada por `SESSION_CACHE_TTL_S` (30 s); use `?refresh=true` para forçar. Chamadas simultâneas dividem uma só checagem; se passar de `SESSION_TIMEOUT_S` (25 s) devolve o último valor com `stale: true` (ou 504 se nunca checou). Se estiver deslogado, também marca `needed: true` com `reason: "login"` em `/captcha/status`. |
 | `POST` | `/check` | Confere um produto. |
 | `POST` | `/check/batch` | Confere vários (lista de itens). |
+| `GET` | `/coupons/active?page=N` | Uma página da carteira ("Meus cupons"): `{status: "ok", page, total_pages, total_coupons, coupons: [{code, campaign_id, status, expiration_date, activation_type, title}]}`. Só cupons com código. Com a conta bloqueada nem abre a página: `status` `captcha` ou `login_required`; página que não deu para ler é `status: "error"` (nunca carteira vazia). Uma página por chamada: quem chama espaça as páginas (o PromoFeed lê a carteira toda a cada 4 h, 10 s entre páginas). |
 | `GET` | `/captcha/status` | Há bloqueio? `{needed, reason, blocked_url, since, session}`. `reason` é `"captcha"` (verificação) ou `"login"` (conta deslogada). |
 | `POST` | `/captcha/session` | Cria a sessão/link de captcha. Corpo opcional `{"url": "..."}`. |
 | `GET` | `/captcha/session/{id}` | `pending` · `solved` · `expired`. |

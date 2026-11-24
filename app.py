@@ -12,7 +12,7 @@ from importlib.metadata import version as pkg_version
 
 from camoufox.async_api import AsyncCamoufox
 from camoufox.fingerprints import generate_fingerprint
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, WebSocket
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 from pathlib import Path
@@ -22,6 +22,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 SEL_SOCIAL_PRODUCT = "a.poly-component__link--action-link"  # "Ir para produto" na vitrine do afiliado (/social/...)
 SEL_LOGGED_IN = "a.nav-header-user-myml, .nav-header-user-myml, [data-js='user-menu']"
 COUPONS_URL = "https://www.mercadolivre.com.br/cupons/active"
+WALLET_LIST_KEYS = ("activeCouponsData", "filteredCouponsData")  # "Meus cupons" primeiro: /cupons/filter traz as duas listas
 COUPONS_TTL_S = 300
 STORE_TTL_S = 600  # cache da leitura da loja por URL
 _h = os.getenv("HEADLESS", "0").lower()
@@ -553,6 +554,56 @@ async def add_coupon(code: str) -> str:
             await page.close()
 
 
+
+def wallet_coupon(raw: dict) -> dict | None:
+    """Cupom da carteira, em snake_case (rawCoupons) ou camelCase (coupons). Sem código = "Eu quero", fora da conferência."""
+    code = str(raw.get("code") or "").strip()
+    if not code:
+        return None
+    future = raw.get("future_coupon_info") or raw.get("futureCouponInfo") or {}
+    status, title = raw.get("status"), raw.get("title")
+    # no ML o expiration_date de cima é o selo de exibição ({"text": "Vence 10 de janeiro"}); a data ISO fica em future_coupon_info
+    expiration = next((v for v in (raw.get("expiration_date"), raw.get("expirationDate"), future.get("expiration_date"),
+                                   future.get("expirationDate")) if isinstance(v, str) and v), None)
+    return {
+        "code": code,
+        "campaign_id": str(raw.get("campaign_id") or raw.get("campaignId") or ""),
+        "status": status.get("id") if isinstance(status, dict) else status,
+        "expiration_date": expiration,
+        "activation_type": raw.get("activation_type") or raw.get("activationType"),
+        "title": title.get("text") if isinstance(title, dict) else title,
+    }
+
+
+def parse_wallet_page(html: str) -> dict:
+    """Uma página de /cupons/active -> {page, total_pages, total_coupons, coupons}. Os dados vêm no JSON de
+    `_n.ctx.r=` (pageProps). Sem a lista lá, ValueError: página que não dá para ler nunca vira "carteira vazia"."""
+    start = html.find("_n.ctx.r=")
+    if start == -1:
+        raise ValueError("página sem _n.ctx.r")
+    try:
+        ctx, _ = json.JSONDecoder().raw_decode(html, start + len("_n.ctx.r="))
+    except ValueError as e:
+        raise ValueError(f"_n.ctx.r ilegível: {e}") from e
+    props = (ctx.get("appProps") or {}).get("pageProps") or {}
+    data = next((props[k] for k in WALLET_LIST_KEYS if isinstance(props.get(k), dict)), None)
+    if data is None:
+        raise ValueError(f"pageProps sem lista de cupons (chaves: {sorted(props)[:12]})")
+    pagination = data.get("pagination")
+    if not isinstance(pagination, dict) or not pagination.get("page"):
+        raise ValueError(f"lista sem pagination: {pagination!r}"[:200])
+    raws = next((data[k] for k in ("rawCoupons", "coupons") if isinstance(data.get(k), list)), None)
+    if raws is None:  # lista sem o array de cupons: ilegível, não carteira vazia
+        raise ValueError(f"lista sem rawCoupons/coupons (chaves: {sorted(data)[:12]})")
+    coupons = [c for c in (wallet_coupon(r) for r in raws if isinstance(r, dict)) if c]
+    page = int(pagination["page"])
+    return {
+        "page": page,
+        "total_pages": max(int(pagination.get("total") or page), page),
+        "total_coupons": (data.get("totalCouponsQuantity") or {}).get("number"),
+        "coupons": coupons,
+    }
+
 coupon_lock = asyncio.Lock()  # evita inserir o mesmo código várias vezes em lote
 
 
@@ -829,6 +880,34 @@ async def session(refresh: bool = False):
         clear_blocked()
     return {"logged_in": logged, "cached": False}
 
+
+
+@api.get("/coupons/active")
+async def wallet_page(page: int = Query(1, ge=1, le=500)):
+    """Uma página da carteira ("Meus cupons"). Quem chama dá o ritmo entre as páginas; com a conta bloqueada nem abre."""
+    if captcha_state["needed"]:
+        reason = "login_required" if captcha_state["reason"] == "login" else "captcha"
+        return {"status": reason, "detail": "conta bloqueada: veja /captcha/status"}
+    async with coupon_pages:
+        tab = await light_page()
+        try:
+            await tab.goto(f"{COUPONS_URL}?page={page}", wait_until="domcontentloaded")
+            if is_login_url(tab.url):
+                flag_blocked("login", HOME_URL)
+                return {"status": "login_required", "detail": f"url: {tab.url}"}
+            if reason := await has_captcha(tab):
+                flag_blocked("captcha", tab.url)
+                return {"status": "captcha", "detail": reason}
+            await tab.wait_for_selector("text=Meus cupons", timeout=15000)
+            parsed = parse_wallet_page(await tab.content())
+            if parsed["page"] != page:  # ML ignorou/limitou ?page=: repetir outra página faria cupons "sumirem"
+                raise ValueError(f"pedida a página {page}, veio a {parsed['page']} de {parsed['total_pages']}")
+        except Exception as e:  # inclui ValueError do parse: erro, nunca carteira vazia
+            return {"status": "error", "detail": f"{type(e).__name__}: {e}"[:300]}
+        finally:
+            await tab.close()
+    stats["wallet_pages"] += 1
+    return {"status": "ok", **parsed}
 
 @api.post("/check")
 async def check_one(item: Item):
