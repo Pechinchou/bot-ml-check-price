@@ -885,10 +885,11 @@ async def session(refresh: bool = False):
 @api.get("/coupons/active")
 async def wallet_page(page: int = Query(1, ge=1, le=500)):
     """Uma página da carteira ("Meus cupons"). Quem chama dá o ritmo entre as páginas; com a conta bloqueada nem abre."""
-    if captcha_state["needed"]:
-        reason = "login_required" if captcha_state["reason"] == "login" else "captcha"
-        return {"status": reason, "detail": "conta bloqueada: veja /captcha/status"}
     async with coupon_pages:
+        # Checked after the semaphore: a request queued behind one that just hit the captcha must not open a tab.
+        if captcha_state["needed"]:
+            reason = "login_required" if captcha_state["reason"] == "login" else "captcha"
+            return {"status": reason, "detail": "conta bloqueada: veja /captcha/status"}
         tab = await light_page()
         try:
             await tab.goto(f"{COUPONS_URL}?page={page}", wait_until="domcontentloaded")
