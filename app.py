@@ -23,6 +23,8 @@ SEL_SOCIAL_PRODUCT = "a.poly-component__link--action-link"  # "Ir para produto" 
 SEL_LOGGED_IN = "a.nav-header-user-myml, .nav-header-user-myml, [data-js='user-menu']"
 COUPONS_URL = "https://www.mercadolivre.com.br/cupons/active"
 COUPONS_TTL_S = 300
+MISSING_COUPON_TTL_S = 600  # não digita de novo um código que o ML já recusou/não listou
+COUPONS_MAX_PAGES = 10
 STORE_TTL_S = 600  # cache da leitura da loja por URL
 _h = os.getenv("HEADLESS", "0").lower()
 HEADLESS = "virtual" if _h == "virtual" else _h in ("1", "true", "yes")  # virtual = Xvfb (só Linux/Docker); headless: não dá p/ resolver captcha
@@ -108,6 +110,7 @@ stats: Counter = Counter()  # contadores p/ /metrics
 captcha_free = asyncio.Event()
 captcha_free.set()
 coupons_cache = (0.0, {})  # (timestamp, {code: cupom})
+missing_coupons: dict[str, tuple[float, str]] = {}  # código -> (ts, msg do ML): já digitado e não apareceu na carteira
 session_cache = (0.0, None)  # (timestamp, logged_in)
 session_lock = asyncio.Lock()  # uma checagem por vez: chamadas simultâneas esperam e reaproveitam o resultado
 captcha_state = {"needed": False, "reason": None, "blocked_url": None, "since": None, "session": None}  # reason: "captcha"|"login"; 1 sessão por vez
@@ -515,7 +518,7 @@ def parse_coupons(html: str) -> dict:
         except ValueError:
             i += 1
             continue
-        if "code" in obj and "discount_type" in obj:
+        if obj.get("code") and "discount_type" in obj:  # cupom sem código (ativação "EU_QUERO") não é digitável
             found[obj["code"].upper()] = obj
     return found
 
@@ -531,7 +534,12 @@ async def load_coupons(force: bool = False) -> dict:
         try:
             await page.goto(COUPONS_URL, wait_until="domcontentloaded")
             await page.wait_for_selector("text=Meus cupons", timeout=15000)
-            found = parse_coupons(await page.content())
+            html = await page.content()
+            found = parse_coupons(html)
+            m = re.search(r'"pagination":\{"page":\d+,"total":(\d+)', html)  # a carteira tem 30 cupons por página
+            for n in range(2, min(int(m.group(1)) if m else 1, COUPONS_MAX_PAGES) + 1):
+                await page.goto(f"{COUPONS_URL}?page={n}", wait_until="domcontentloaded")
+                found |= parse_coupons(await page.content())
         finally:
             await page.close()
     coupons_cache = (time.time(), found)
@@ -565,8 +573,13 @@ async def get_coupon(code: str) -> tuple[dict | None, str]:
     async with coupon_lock:
         if c := (await load_coupons()).get(code):
             return c, ""
+        if (miss := missing_coupons.get(code)) and fresh(miss[0], time.time(), MISSING_COUPON_TTL_S):
+            return None, miss[1]
         msg = await add_coupon(code)
-        return (await load_coupons(force=True)).get(code), msg
+        c = (await load_coupons(force=True)).get(code)
+        if c is None:
+            missing_coupons[code] = (time.time(), msg)
+        return c, msg
 
 
 async def coupon_eligible(item_id: str | None, price: float, loyalty: str, code: str) -> bool | None:
@@ -697,7 +710,8 @@ async def check(item: Item) -> dict:
     out = {"status": "ok", "store_price": price, "price_matches": int(price) == int(item.price),
            "coupon_applied": False, "price_with_coupon": None, "cached": age is not None,
            "cache_age_s": None if age is None else round(age)}
-    if item.coupon:
+    in_page = store.get("coupon_in_page", False)
+    if item.coupon and not in_page:  # vitrine já com o badge "com Cupom": cupom aplicado, só compara o preço lido
         try:
             c, msg = await bounded(get_coupon(item.coupon), REQUEST_TIMEOUT_S)
         except Exception as e:  # lista de cupons não carregou: inconclusivo, não "inválido"
@@ -714,7 +728,6 @@ async def check(item: Item) -> dict:
                 if out["status"] == "ok":
                     with_coupon = final
                     out.update(coupon_applied=True, price_with_coupon=final)
-    in_page = store.get("coupon_in_page", False)
     if in_page and out["status"] == "ok":  # a vitrine já tem o cupom: não desconta de novo
         out.update(coupon_applied=False, price_with_coupon=price if item.coupon else None)
         with_coupon = None

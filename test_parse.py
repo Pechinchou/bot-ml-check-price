@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app import coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, is_social_page, login_step, parse_price, parse_product_read, stored_fingerprint, safe_static_path, session_valid
+from app import parse_coupons, coupon_failure, coupon_in_page, compare, discount, final_verdict, fresh, has_login_cookies, host_allowed, html_logged_in, is_login_url, is_social_page, login_step, parse_price, parse_product_read, stored_fingerprint, safe_static_path, session_valid
 
 assert parse_price("R$ 1.299,90") == 1299.9
 assert parse_price("199,00") == 199.0
@@ -27,6 +27,8 @@ assert final_verdict(100, 50, None) == (100, False)
 assert final_verdict(2675.2, 2674, 2475.2, in_page=True) == (2675.2, True)  # cupom já na página, R$ 1 de diferença
 assert coupon_in_page("R$ 2.675,20 no Pix com Cupom", 2675.2, 2675.2) and coupon_in_page("", 2675.2, 2875.2)
 assert not coupon_in_page("R$ 100", 100, 100)
+assert parse_coupons('{"campaign_id":"1","code":"a","discount_type":"PERCENT"} x {"campaign_id":"2","code":"","discount_type":"FIXED"}') \
+    .keys() == {"A"}  # código vazio ignorado
 assert coupon_failure("Inserir Erro Confira se o cupom está correto") == "coupon_invalid"
 assert coupon_failure("Este cupom já foi adicionado") == "coupon_unverified"
 assert coupon_failure("O cupom esgotou. Há outros") == "coupon_sold_out"
